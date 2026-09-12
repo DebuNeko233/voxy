@@ -74,9 +74,11 @@ public final class VkImage2D {
 
             //Mirror Minecraft 26.2's VulkanGpuTexture allocator strategy: VMA
             //chooses/suballocates device-preferred memory from the allocator
-            //owned by the adopted VulkanDevice.
+            //owned by the adopted VulkanDevice. WITHIN_BUDGET prevents Voxy's
+            //large atlas/frame targets from silently oversubscribing the heap.
             var aci = VmaAllocationCreateInfo.calloc(stack)
                     .usage(Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE)
+                    .flags(Vma.VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT)
                     .preferredFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             var pImg = stack.mallocLong(1);
             var pAllocation = stack.mallocPointer(1);
