@@ -144,7 +144,17 @@ public class VkUploadStream extends AbstractUploadStream {
     private void retireUpTo(long retiredFrame) {
         while (!this.frames.isEmpty() && this.frames.peek().frameIdx <= retiredFrame) {
             var frame = this.frames.pop();
-            frame.allocations.forEach(this.allocationArena::free);
+            Throwable failure = null;
+            for (int i = 0; i < frame.allocations.size(); i++) {
+                try {
+                    this.allocationArena.free(frame.allocations.getLong(i));
+                } catch (RuntimeException | Error releaseFailure) {
+                    if (failure == null) failure = releaseFailure;
+                    else failure.addSuppressed(releaseFailure);
+                }
+            }
+            if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (failure instanceof Error errorFailure) throw errorFailure;
         }
     }
 
