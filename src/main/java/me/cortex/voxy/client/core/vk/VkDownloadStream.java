@@ -3,7 +3,6 @@ package me.cortex.voxy.client.core.vk;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import me.cortex.voxy.client.core.rendering.util.AbstractDownloadStream;
 import me.cortex.voxy.client.core.rendering.util.IDeviceBuffer;
-import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.AllocationArena;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkBufferCopy;
@@ -68,17 +67,9 @@ public class VkDownloadStream extends AbstractDownloadStream {
         if (this.caddr == -1 || !this.allocationArena.expand(this.caddr, (int) size)) {
             this.caddr = this.allocationArena.alloc((int) size);
             if (this.caddr == SIZE_LIMIT) {
-                Logger.warn("VK download stream full, force-idling the device to recover; this will hitch");
-                this.commit();
-                int attempts = 10;
-                while (--attempts != 0 && this.caddr == SIZE_LIMIT) {
-                    this.ctx.waitIdleRetireAll();
-                    this.tick();
-                    this.caddr = this.allocationArena.alloc((int) size);
-                }
-                if (this.caddr == SIZE_LIMIT) {
-                    throw new IllegalStateException("Could not allocate readback space even after device idle");
-                }
+                throw new IllegalStateException("Vulkan readback staging exhausted ("
+                        + (this.readbackBuffer.size() >> 20) + " MiB, pendingFrames=" + this.frames.size()
+                        + "). Cannot safely force-reuse readback memory before Minecraft submits the current frame.");
             }
             this.thisFrameAllocations.add(this.caddr);
             this.offset = size;
@@ -138,35 +129,44 @@ public class VkDownloadStream extends AbstractDownloadStream {
                     else failure.addSuppressed(callbackFailure);
                 }
             }
-            try {
-                frame.allocations.forEach(this.allocationArena::free);
-            } catch (RuntimeException | Error releaseFailure) {
-                if (failure == null) failure = releaseFailure;
-                else failure.addSuppressed(releaseFailure);
+            for (int i = 0; i < frame.allocations.size(); i++) {
+                try {
+                    this.allocationArena.free(frame.allocations.getLong(i));
+                } catch (RuntimeException | Error releaseFailure) {
+                    if (failure == null) failure = releaseFailure;
+                    else failure.addSuppressed(releaseFailure);
+                }
             }
             if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
             if (failure instanceof Error errorFailure) throw errorFailure;
         }
     }
 
+    /** Discard CPU readback callbacks/bookkeeping without pretending GPU work completed. */
     @Override
     public void waitDiscard() {
-        this.ctx.waitIdleRetireAll();
-        while (!this.frames.isEmpty()) {
-            var frame = this.frames.pop();
-            frame.allocations.forEach(this.allocationArena::free);
-        }
+        this.frames.clear();
+        this.thisFrameAllocations.clear();
+        this.downloadList.clear();
+        this.thisFrameDownloadList.clear();
+        this.allocationArena.reset();
+        this.caddr = -1;
+        this.offset = 0;
+        this.recordFrame = -1;
     }
 
+    /**
+     * Vulkan shutdown does not need stale visibility callbacks. Actual VkBuffer
+     * lifetime is protected independently by Minecraft's destruction queue.
+     */
     @Override
     public void flushWaitClear() {
-        this.tick();
-        this.ctx.waitIdleRetireAll();
-        if (!this.frames.isEmpty()) throw new IllegalStateException();
+        this.waitDiscard();
     }
 
     @Override
     public void free() {
+        this.waitDiscard();
         this.readbackBuffer.free();
     }
 
