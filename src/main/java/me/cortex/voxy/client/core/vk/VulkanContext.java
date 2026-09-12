@@ -24,7 +24,7 @@ import static org.lwjgl.vulkan.VK11.*;
 // when MC 26.2 runs on its native Vulkan backend, Voxy ADOPTS the game's
 // VkInstance/VkDevice/queue via IVkHost and allocates only its own command pool.
 // MC owns (and destroys) the device/instance, so destroy() tears down only the
-// command pool Voxy created here.
+// resources Voxy created on the adopted device.
 public final class VulkanContext {
     public final VkInstance instance;
     public final VkPhysicalDevice physicalDevice;
@@ -58,6 +58,8 @@ public final class VulkanContext {
     public final boolean subgroupArithmetic;
     public final int subgroupSize;
     public final String deviceName;
+    public final boolean integratedGpu;
+    public final long deviceLocalHeapBytes;
     /**
      * Older MoltenVK versions enable SPIRV-Cross' discarded-fragment store
      * checks on every GPU.  On the non-Apple Mac GPU families those checks use
@@ -93,11 +95,27 @@ public final class VulkanContext {
         this.subgroupArithmetic = ENABLE_SUBGROUP_PATHS && deviceSupportsSubgroups;
         String name;
         int vendorId;
+        boolean integrated;
+        long localHeapBytes = 0;
         try (MemoryStack stack = stackPush()) {
             var props = VkPhysicalDeviceProperties.calloc(stack);
             vkGetPhysicalDeviceProperties(this.physicalDevice, props);
             name = props.deviceNameString();
             vendorId = props.vendorID();
+            integrated = props.deviceType() == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+
+            var memProps = VkPhysicalDeviceMemoryProperties.calloc(stack);
+            vkGetPhysicalDeviceMemoryProperties(this.physicalDevice, memProps);
+            for (int i = 0; i < memProps.memoryHeapCount(); i++) {
+                var heap = memProps.memoryHeaps(i);
+                if ((heap.flags() & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                    //Use the largest local heap rather than summing heaps. Some
+                    //drivers expose multiple heaps that are not independently
+                    //usable by a single allocation strategy.
+                    localHeapBytes = Math.max(localHeapBytes, heap.size());
+                }
+            }
+
             var cpci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()
                     .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
                     .queueFamilyIndex(this.queueFamily);
@@ -105,11 +123,15 @@ public final class VulkanContext {
             check(vkCreateCommandPool(this.device, cpci, null, pPool), "vkCreateCommandPool(adopted)");
             this.commandPool = pPool.get(0);
         }
+        this.integratedGpu = integrated;
+        this.deviceLocalHeapBytes = localHeapBytes;
         boolean macOS = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac");
         this.needsSampleMaskDiscard = macOS && vendorId != 0x106B;//Apple's PCI vendor id
         this.deviceName = name + " (MC host)";
         Logger.info("Voxy Vulkan context adopted Minecraft device: " + this.deviceName
                 + " (drawIndirectCount=" + this.hasDrawIndirectCount
+                + ", integratedGpu=" + this.integratedGpu
+                + ", deviceLocalHeapMiB=" + (this.deviceLocalHeapBytes >> 20)
                 + ", sampleMaskDiscard=" + this.needsSampleMaskDiscard
                 + ", subgroupArithmetic=" + this.subgroupArithmetic
                 + " (deviceCapable=" + deviceSupportsSubgroups + ", gate=" + ENABLE_SUBGROUP_PATHS + ")"
@@ -168,6 +190,25 @@ public final class VulkanContext {
         return this.uniformAlign;
     }
 
+    /**
+     * Initial geometry-pool target derived from the physical device rather than
+     * unconditionally reserving 2 GiB. VkSectionGeometryData can still halve
+     * this on allocation failure, but most GPUs should now start at a sensible
+     * size and avoid creating immediate memory pressure.
+     */
+    public long recommendedGeometryCapacityBytes() {
+        final long minimum = 256L << 20;
+        final long maximum = (this.integratedGpu ? 1024L : 2048L) << 20;
+        long target;
+        if (this.deviceLocalHeapBytes > 0) {
+            target = this.deviceLocalHeapBytes / (this.integratedGpu ? 8 : 4);
+        } else {
+            target = this.integratedGpu ? (512L << 20) : (1024L << 20);
+        }
+        target = Math.max(minimum, Math.min(maximum, target));
+        return target & ~7L;
+    }
+
     //Device memory properties are immutable for the device lifetime; cache them
     // instead of re-querying the driver per allocation. Freed in destroy().
     private VkPhysicalDeviceMemoryProperties memoryProperties;
@@ -185,6 +226,7 @@ public final class VulkanContext {
 
     public void destroy() {
         vkDeviceWaitIdle(this.device);
+        VkImage2D.destroySamplers(this);
         vkDestroyCommandPool(this.device, this.commandPool, null);
         if (this.subgroupProps != null) {
             this.subgroupProps.free();
@@ -194,6 +236,6 @@ public final class VulkanContext {
             this.memoryProperties.free();
             this.memoryProperties = null;
         }
-        //Host mode: MC owns the device/instance — only the command pool above was ours.
+        //Host mode: MC owns the device/instance — only Voxy-owned objects are destroyed here.
     }
 }
