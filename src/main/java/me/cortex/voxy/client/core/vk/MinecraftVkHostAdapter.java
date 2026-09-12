@@ -17,6 +17,10 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         this.device = device;
     }
 
+    private com.mojang.blaze3d.vulkan.VulkanCommandEncoder encoder() {
+        return ((AccessorVulkanDevice) (Object) this.device).voxy$commandEncoder();
+    }
+
     @Override public VkInstance instance() { return this.device.instance().vkInstance(); }
     @Override public VkPhysicalDevice physicalDevice() { return this.device.vkDevice().getPhysicalDevice(); }
     @Override public VkDevice device() { return this.device.vkDevice(); }
@@ -25,10 +29,17 @@ public final class MinecraftVkHostAdapter implements IVkHost {
 
     @Override
     public VkCommandBuffer frameCommandBuffer() {
-        //Minecraft 26.2 stores one persistent final commandEncoder on the device.
-        //Access that exact object instead of depending on createCommandEncoder()
-        // returning the same encoder implementation forever.
-        var encoder = ((AccessorVulkanDevice) (Object) this.device).voxy$commandEncoder();
-        return ((AccessorVulkanCommandEncoder) (Object) encoder).voxy$currentCommandBuffer();
+        return ((AccessorVulkanCommandEncoder) (Object) this.encoder()).voxy$currentCommandBuffer();
+    }
+
+    @Override
+    public void deferUntilSubmissionComplete(Runnable action) {
+        if (action == null) throw new IllegalArgumentException("retirement action is null");
+        //Mojang's VulkanCommandEncoder owns a two-slot DestructionQueue. submit()
+        //waits the matching timeline-semaphore value before rotating a slot, so
+        //this callback runs only after every command in the relevant submission
+        //has completed. That is the Vulkan-valid lifetime boundary for Voxy's
+        //buffers/images/pipelines and CPU staging bookkeeping.
+        this.encoder().queueForDestroy(action::run);
     }
 }
