@@ -63,6 +63,20 @@ public final class VkFrameHost {
                 dstAccess);
     }
 
+    /**
+     * Handoff barrier used after Voxy has written a Minecraft-owned target. The
+     * next Blaze3D user is outside Voxy's control and may be an attachment,
+     * sampler, transfer, or post-processing input, so publish to a deliberately
+     * broad destination scope while preserving Minecraft's GENERAL layout.
+     */
+    public static void barrierMcImageForExternalUse(VkCommandBuffer cmd, GpuTextureView view, boolean depth) {
+        barrierMcImageGeneral(cmd, view, depth,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
+
     private static void barrierMcImageGeneral(VkCommandBuffer cmd, GpuTextureView view, boolean depth,
                                                int srcStage, int srcAccess,
                                                int dstStage, int dstAccess) {
