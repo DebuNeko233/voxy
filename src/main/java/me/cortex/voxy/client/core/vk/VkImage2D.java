@@ -48,6 +48,11 @@ public final class VkImage2D {
         this.format = format;
         this.aspect = aspect;
         var vctx = ctx.vk();
+
+        long createdImage = VK_NULL_HANDLE;
+        long allocatedMemory = VK_NULL_HANDLE;
+        long createdView = VK_NULL_HANDLE;
+        long[] createdMipViews = perMipViews ? new long[mipLevels] : null;
         try (MemoryStack stack = stackPush()) {
             var ici = VkImageCreateInfo.calloc(stack).sType$Default()
                     .imageType(VK_IMAGE_TYPE_2D)
@@ -67,34 +72,50 @@ public final class VkImage2D {
             }
             var pImg = stack.mallocLong(1);
             check(vkCreateImage(vctx.device, ici, null, pImg), "vkCreateImage");
-            this.image = pImg.get(0);
+            createdImage = pImg.get(0);
 
             var req = VkMemoryRequirements.calloc(stack);
-            vkGetImageMemoryRequirements(vctx.device, this.image, req);
+            vkGetImageMemoryRequirements(vctx.device, createdImage, req);
             var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
                     .allocationSize(req.size())
                     .memoryTypeIndex(vctx.findMemoryType(req.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
             var pMem = stack.mallocLong(1);
             check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory(image)");
-            this.memory = pMem.get(0);
-            check(vkBindImageMemory(vctx.device, this.image, this.memory, 0), "vkBindImageMemory");
+            allocatedMemory = pMem.get(0);
+            check(vkBindImageMemory(vctx.device, createdImage, allocatedMemory, 0), "vkBindImageMemory");
 
-            this.view = createView(stack, vctx, 0, mipLevels);
-            if (perMipViews) {
-                this.mipViews = new long[mipLevels];
+            createdView = createView(stack, vctx, createdImage, format, aspect, 0, mipLevels);
+            if (createdMipViews != null) {
                 for (int i = 0; i < mipLevels; i++) {
-                    this.mipViews[i] = createView(stack, vctx, i, 1);
+                    createdMipViews[i] = createView(stack, vctx, createdImage, format, aspect, i, 1);
                 }
-            } else {
-                this.mipViews = null;
             }
+        } catch (RuntimeException | Error failure) {
+            //Image recreation happens during viewport resizes and renderer reloads.
+            //Keep construction transactional so an allocation/view failure cannot
+            //strand device memory or views and progressively increase VRAM usage.
+            if (createdMipViews != null) {
+                for (long mipView : createdMipViews) {
+                    if (mipView != VK_NULL_HANDLE) vkDestroyImageView(vctx.device, mipView, null);
+                }
+            }
+            if (createdView != VK_NULL_HANDLE) vkDestroyImageView(vctx.device, createdView, null);
+            if (createdImage != VK_NULL_HANDLE) vkDestroyImage(vctx.device, createdImage, null);
+            if (allocatedMemory != VK_NULL_HANDLE) vkFreeMemory(vctx.device, allocatedMemory, null);
+            throw failure;
         }
+
+        this.image = createdImage;
+        this.memory = allocatedMemory;
+        this.view = createdView;
+        this.mipViews = createdMipViews;
     }
 
-    private long createView(MemoryStack stack, VulkanContext vctx, int baseMip, int mipCount) {
+    private static long createView(MemoryStack stack, VulkanContext vctx, long image, int format, int aspect,
+                                   int baseMip, int mipCount) {
         var vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
-                .image(this.image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(this.format);
-        vci.subresourceRange().aspectMask(this.aspect).baseMipLevel(baseMip).levelCount(mipCount).baseArrayLayer(0).layerCount(1);
+                .image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(format);
+        vci.subresourceRange().aspectMask(aspect).baseMipLevel(baseMip).levelCount(mipCount).baseArrayLayer(0).layerCount(1);
         var pView = stack.mallocLong(1);
         check(vkCreateImageView(vctx.device, vci, null, pView), "vkCreateImageView");
         return pView.get(0);
@@ -174,11 +195,13 @@ public final class VkImage2D {
     }
 
     /** Simple sampler factory (nearest/clamped or nearest-mipmap for HiZ etc).
-     *  Cached by (mipmapNearest, linear) so the ~9 call sites across the renderer
-     *  share ~4 sampler handles instead of creating one each. */
-    private static final java.util.Map<Long, Long> SAMPLER_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+     *  Cached per Vulkan device so the ~9 call sites across the renderer share a
+     *  handful of sampler handles. */
+    private record SamplerKey(long deviceAddress, boolean mipmapNearest, boolean linear) {}
+    private static final java.util.Map<SamplerKey, Long> SAMPLER_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
     public static long createSampler(VulkanContext ctx, boolean mipmapNearest, boolean linear) {
-        long key = ctx.device.address() ^ (mipmapNearest ? 1L : 0L) ^ (linear ? 2L : 0L);
+        var key = new SamplerKey(ctx.device.address(), mipmapNearest, linear);
         Long cached = SAMPLER_CACHE.get(key);
         if (cached != null) return cached;
         try (MemoryStack stack = stackPush()) {
@@ -193,8 +216,23 @@ public final class VkImage2D {
             var pSampler = stack.mallocLong(1);
             check(vkCreateSampler(ctx.device, sci, null, pSampler), "vkCreateSampler");
             long handle = pSampler.get(0);
-            SAMPLER_CACHE.put(key, handle);
+            Long raced = SAMPLER_CACHE.putIfAbsent(key, handle);
+            if (raced != null) {
+                vkDestroySampler(ctx.device, handle, null);
+                return raced;
+            }
             return handle;
+        }
+    }
+
+    /** Destroy all cached sampler handles owned by this adopted VkDevice. */
+    public static void destroySamplers(VulkanContext ctx) {
+        long deviceAddress = ctx.device.address();
+        for (var entry : SAMPLER_CACHE.entrySet()) {
+            if (entry.getKey().deviceAddress == deviceAddress
+                    && SAMPLER_CACHE.remove(entry.getKey(), entry.getValue())) {
+                vkDestroySampler(ctx.device, entry.getValue(), null);
+            }
         }
     }
 }
