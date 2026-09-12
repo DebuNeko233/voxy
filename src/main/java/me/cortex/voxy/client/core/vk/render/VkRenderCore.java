@@ -32,9 +32,6 @@ import net.minecraft.client.Minecraft;
 import java.util.Arrays;
 import java.util.List;
 
-//Pure-Vulkan render core. Every field below is owned by this object; construction
-// is transactional so a failed shader/allocation cannot strand workers, global
-// backend singletons, or Vulkan allocations.
 public class VkRenderCore {
     private final WorldEngine worldIn;
     private final VkFrameCtx frameCtx;
@@ -71,6 +68,7 @@ public class VkRenderCore {
         ModelBakerySubsystem modelBakery = null;
         RenderGenerationService generation = null;
         VkSectionGeometryData geometry = null;
+        VkNodeGpuOps nodeOps = null;
         AsyncNodeManager nodes = null;
         VkNodeCleaner cleaner = null;
         VkTraversal traverse = null;
@@ -105,7 +103,14 @@ public class VkRenderCore {
                     + (vctx.deviceLocalHeapBytes >> 20) + " MiB device-local heap"
                     + (vctx.integratedGpu ? " (integrated GPU policy)" : " (discrete GPU policy)"));
             geometry = new VkSectionGeometryData(frame, 1 << 20, geometryCapacity);
-            nodes = new AsyncNodeManager(1 << 21, geometry, generation, new VkNodeGpuOps(frame, upload));
+
+            //Keep ownership locally until AsyncNodeManager has completed its own
+            // construction. If that constructor throws, there is no manager
+            // instance whose stop() can release the GPU ops.
+            nodeOps = new VkNodeGpuOps(frame, upload);
+            nodes = new AsyncNodeManager(1 << 21, geometry, generation, nodeOps);
+            nodeOps = null; //ownership transferred to AsyncNodeManager
+
             cleaner = new VkNodeCleaner(frame, upload, download, nodes);
             traverse = new VkTraversal(frame, upload, download, props, nodes, cleaner, generation);
             terrain = new VkTerrainRenderer(frame, upload, download, props, geometry, models);
@@ -134,8 +139,6 @@ public class VkRenderCore {
 
             frame.flushImmediate();
         } catch (RuntimeException | Error failure) {
-            //Stop producers and detach callbacks before touching the resources they
-            // feed. Run every cleanup step even if an earlier one itself fails.
             try {
                 world.setDirtyCallback(null);
                 world.getMapper().setBiomeCallback(null);
@@ -145,6 +148,8 @@ public class VkRenderCore {
             }
             if (nodes != null) {
                 try { nodes.stop(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            } else if (nodeOps != null) {
+                try { nodeOps.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             }
             if (generation != null) {
                 try { generation.shutdown(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
@@ -153,7 +158,6 @@ public class VkRenderCore {
                 try { frame.waitIdleRetireAll(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             }
 
-            //ModelBakerySubsystem owns VkModelStore once it has been constructed.
             if (modelBakery != null) {
                 try { modelBakery.shutdown(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             } else if (models != null) {
