@@ -155,9 +155,6 @@ public final class VkFrameCtx {
             int status = vkGetEventStatus(this.ctx.device, frame.event);
             if (status == VK_EVENT_RESET) break;
             if (status != VK_EVENT_SET) {
-                //Do not silently reinterpret device-lost or any future Vulkan
-                // error as "not ready". That would freeze retiredCounter forever
-                // and make every deferred buffer/image/pipeline accumulate.
                 check(status, "vkGetEventStatus(frame " + frame.frameIdx + ")");
             }
             this.inFlight.pop();
@@ -226,17 +223,31 @@ public final class VkFrameCtx {
         }
     }
 
+    private void markDeferredWorkForCurrentFrame() {
+        //A resource can be retired during a live MC frame before Voxy records any
+        //other command (for example, a transactional resize that fails halfway).
+        //Without a frame marker that destroy would be tagged with frameCounter
+        //but no event would ever advance retiredCounter to it, especially after
+        //the renderer fault latch disables further frames.
+        if (this.frameCmd != null) {
+            this.anyWorkThisFrame = true;
+        }
+    }
+
     public void deferDestroy(long buffer, long memory) {
         this.pendingDestroys.add(new PendingDestroy(this.frameCounter, buffer, VK_NULL_HANDLE, VK_NULL_HANDLE, memory));
+        this.markDeferredWorkForCurrentFrame();
     }
 
     public void deferDestroyImage(long image, long view, long memory) {
         this.pendingDestroys.add(new PendingDestroy(this.frameCounter, VK_NULL_HANDLE, image, view, memory));
+        this.markDeferredWorkForCurrentFrame();
     }
 
     public void deferDestroyPipeline(long pipeline, long pipelineLayout, long[] modules) {
         this.pendingPipelineDestroys.add(new PendingPipelineDestroy(
                 this.frameCounter, pipeline, pipelineLayout, modules == null ? null : modules.clone()));
+        this.markDeferredWorkForCurrentFrame();
     }
 
     public void fillBuffer(VkBuffer buffer, long offset, long size, int value) {
