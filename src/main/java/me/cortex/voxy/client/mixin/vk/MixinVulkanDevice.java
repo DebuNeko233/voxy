@@ -31,9 +31,9 @@ public class MixinVulkanDevice {
 
     @Inject(method = "close", at = @At("HEAD"))
     private void voxy$shutdownRendererBeforeDeviceClose(CallbackInfo ci) {
-        //Phase 1: stop Voxy while Minecraft's command encoder is still alive.
-        //VkBuffer/VkImage/VkPipeline frees can therefore enqueue destruction
-        //callbacks onto Blaze3D's submission-safe DestructionQueue.
+        //Phase 1: stop Voxy while Minecraft's command encoder and VMA allocator
+        //are still alive. Per-world resources can therefore retire through
+        //Blaze3D's own submission/destruction lifecycle before device teardown.
         try {
             var holder = IVoxyRenderSystemHolder.getNullableHolder();
             if (holder != null) {
@@ -55,8 +55,8 @@ public class MixinVulkanDevice {
     private void voxy$shutdownBackendAfterSubmissionDrain(CallbackInfo ci) {
         //Phase 2: VulkanCommandEncoder.destroy() has waited the graphics queue
         //idle and drained its destruction queues. Voxy can now destroy only its
-        //context-owned static caches and private immediate command pool without
-        //racing any submitted Minecraft command buffer.
+        //device-lifetime sampler/descriptor-layout caches and Java-side context
+        //metadata before Minecraft destroys the shared VMA allocator/VkDevice.
         try {
             VulkanBackend.shutdown();
         } catch (Throwable t) {
