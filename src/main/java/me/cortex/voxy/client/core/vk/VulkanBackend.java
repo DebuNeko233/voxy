@@ -13,15 +13,11 @@ public final class VulkanBackend {
     private static VulkanContext context;
     private static String unsupportedReason = "not probed";
 
-
-    //True when MC is on Vulkan AND the host adapter is registered AND the LWJGL
-    // Vulkan bindings + MC's device could be adopted.
     public static boolean shouldUseVulkan() {
         if (!MinecraftVkHost.isMinecraftOnVulkan()) {
-            return false;//MC is on OpenGL -> Voxy follows it onto OpenGL
+            return false;
         }
         if (MinecraftVkHost.get() == null) {
-            //MC reports Vulkan but the Blaze3D-VK adapter has not registered a host yet
             Logger.info("Voxy: Minecraft on Vulkan but host adapter not yet registered");
             return false;
         }
@@ -58,13 +54,20 @@ public final class VulkanBackend {
 
     public static String statusLine() {
         if (supported == null) return "vk: unprobed";
-        return supported ? ("vk: host(" + context.deviceName + ")") : ("vk: unavailable (" + unsupportedReason + ")");
+        return supported
+                ? ("vk: host(" + context.deviceName + "), images=" + VkImage2D.getCount()
+                + "/" + (VkImage2D.getTotalAllocationSize() >> 20) + "MiB")
+                : ("vk: unavailable (" + unsupportedReason + ")");
     }
 
     public static synchronized void shutdown() {
         //Host-adopted: do not destroy MC's device (VulkanContext.destroy handles this)
-        if (context != null) { context.destroy(); context = null; }
+        if (context != null) {
+            context.destroy();
+            context = null;
+        }
         supported = null;
+        unsupportedReason = "not probed";
     }
 
     private VulkanBackend() {}
