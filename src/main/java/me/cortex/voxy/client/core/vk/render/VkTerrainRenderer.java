@@ -33,17 +33,22 @@ public class VkTerrainRenderer {
     private static final int TRANSLUCENT_OFFSET = VkViewport.OPAQUE_DRAW_COUNT;
     private static final int TEMPORAL_OFFSET = TRANSLUCENT_OFFSET + VkViewport.TRANSLUCENT_DRAW_COUNT;
 
+    //cmdgen.comp can emit one double-sided + six directional opaque commands
+    //per visible section. Temporal generation mirrors those opaque commands, while
+    //translucency contributes at most one command per section. On Minecraft 26.2
+    //drawIndirectCount is not enabled on the adopted logical device, so the
+    //fixed-count fallback must use these deterministic upper bounds rather than a
+    //stale CPU readback. Every unused command is pre-zeroed, making the extra
+    //indirect records legal zero-draws instead of visible overdraw.
+    private static final int MAX_OPAQUE_COMMANDS_PER_SECTION = 7;
+    private static final int MAX_TEMPORAL_COMMANDS_PER_SECTION = 7;
+    private static final int MAX_TRANSLUCENT_COMMANDS_PER_SECTION = 1;
+
     private final VkFrameCtx ctx;
     private final VkUploadStream uploadStream;
-    private final VkDownloadStream downloadStream;
     private final RenderProperties properties;
     private final VkSectionGeometryData geometry;
     private final VkModelStore modelStore;
-
-    private int fbOpaqueDraws = 0;
-    private int fbTranslucentDraws = 0;
-    private int fbTemporalDraws = 0;
-    private boolean hasAnyReadback = false;
 
     private final VkBuffer uniform;
     private final VkBuffer distanceCountBuffer;
@@ -64,7 +69,6 @@ public class VkTerrainRenderer {
                              RenderProperties properties, VkSectionGeometryData geometry, VkModelStore modelStore) {
         this.ctx = ctx;
         this.uploadStream = uploadStream;
-        this.downloadStream = downloadStream;
         this.properties = properties;
         this.geometry = geometry;
         this.modelStore = modelStore;
@@ -336,50 +340,39 @@ public class VkTerrainRenderer {
                     .push(cmd);
         }
         vkCmdDispatchIndirect(cmd, viewport.drawCountCallBuffer.buffer, 0);
-
-        if (!this.ctx.vk().hasDrawIndirectCount) {
-            this.downloadStream.download(viewport.drawCountCallBuffer, 12, 12, (ptr, size) -> {
-                this.fbOpaqueDraws = clampCount(MemoryUtil.memGetInt(ptr), VkViewport.OPAQUE_DRAW_COUNT);
-                this.fbTranslucentDraws = clampCount(MemoryUtil.memGetInt(ptr + 4), VkViewport.TRANSLUCENT_DRAW_COUNT);
-                this.fbTemporalDraws = clampCount(MemoryUtil.memGetInt(ptr + 8), VkViewport.TEMPORAL_DRAW_COUNT);
-                this.hasAnyReadback = true;
-            });
-        }
     }
 
-    private static int clampCount(int value, int cap) {
-        return value < 0 ? 0 : Math.min(value, cap);
-    }
-
-    private int fixedCountBudget(int lastKnownCount, int headroom, int cap) {
-        if (this.ctx.vk().hasDrawIndirectCount) return cap;
-        if (!this.hasAnyReadback) return 0;
-        int budget = (int) (lastKnownCount * 1.5f) + headroom;
-        return Math.min(cap, Math.max(0, budget));
+    private static int fixedCountUpperBound(int sectionCount, int commandsPerSection, int capacity) {
+        if (sectionCount <= 0) return 0;
+        long required = (long) sectionCount * commandsPerSection;
+        return (int) Math.min(required, (long) capacity);
     }
 
     public void renderOpaque(VkViewport viewport, boolean clearTargets) {
         this.ensureTerrainPipelines(viewport);
-        if (this.geometry.getSectionCount() == 0) return;
+        int sectionCount = this.geometry.getSectionCount();
+        if (sectionCount == 0) return;
         this.uploadUniform(viewport);
-        int cap = Math.min((int) (this.geometry.getSectionCount() * 4.4 + 128), VkViewport.OPAQUE_DRAW_COUNT);
-        int maxDraw = this.fixedCountBudget(this.fbOpaqueDraws, 1024, cap);
+        int maxDraw = fixedCountUpperBound(sectionCount,
+                MAX_OPAQUE_COMMANDS_PER_SECTION, VkViewport.OPAQUE_DRAW_COUNT);
         this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, 0, 4 * 3, maxDraw);
     }
 
     public void renderTemporal(VkViewport viewport) {
         this.ensureTerrainPipelines(viewport);
-        if (this.geometry.getSectionCount() == 0) return;
-        int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TEMPORAL_DRAW_COUNT);
-        int maxDraw = this.fixedCountBudget(this.fbTemporalDraws, 256, cap);
+        int sectionCount = this.geometry.getSectionCount();
+        if (sectionCount == 0) return;
+        int maxDraw = fixedCountUpperBound(sectionCount,
+                MAX_TEMPORAL_COMMANDS_PER_SECTION, VkViewport.TEMPORAL_DRAW_COUNT);
         this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw);
     }
 
     public void renderTranslucent(VkViewport viewport) {
         this.ensureTerrainPipelines(viewport);
-        if (this.geometry.getSectionCount() == 0) return;
-        int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
-        int maxDraw = this.fixedCountBudget(this.fbTranslucentDraws, 256, cap);
+        int sectionCount = this.geometry.getSectionCount();
+        if (sectionCount == 0) return;
+        int maxDraw = fixedCountUpperBound(sectionCount,
+                MAX_TRANSLUCENT_COMMANDS_PER_SECTION, VkViewport.TRANSLUCENT_DRAW_COUNT);
         this.renderTerrain(viewport, viewport.colourSSAO.view, this.terrainTranslucent, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw);
     }
 
