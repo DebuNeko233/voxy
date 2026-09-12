@@ -27,12 +27,6 @@ import static org.lwjgl.vulkan.VK10.*;
 // test, capturing the far bound of the vanilla-covered volume. The terrain
 // fragment shader (quads.frag, sampler binding 10) then discards LOD fragments
 // that vanilla terrain will cover, saving overdraw.
-//
-//Differences from GL, both deliberate:
-//  - one 36-index box per instance instead of the 32-box batches (no
-//    baseInstance arithmetic — gl_InstanceIndex is the chunk id directly);
-//  - no face culling: with the further depth compare the back faces win the
-//    depth test anyway, which is exactly the bound the GL backface trick kept.
 public class VkBoundRenderer {
     private final VkFrameCtx ctx;
     private final VkUploadStream uploadStream;
@@ -51,30 +45,43 @@ public class VkBoundRenderer {
         this.ctx = ctx;
         this.uploadStream = uploadStream;
         this.properties = properties;
-        this.uniform = new VkBuffer(ctx, 128).zero();
 
-        this.boxIndexBuffer = new VkBuffer(ctx, 6 * 2 * 3 * 2L);
-        {
-            long ptr = uploadStream.upload(this.boxIndexBuffer, 0, this.boxIndexBuffer.size());
+        VkBuffer createdUniform = null;
+        VkBuffer createdIndex = null;
+        VkShaderPipeline createdPipeline = null;
+        try {
+            createdUniform = new VkBuffer(ctx, 128).zero();
+            createdIndex = new VkBuffer(ctx, 6 * 2 * 3 * 2L);
+            long ptr = uploadStream.upload(createdIndex, 0, createdIndex.size());
             VkCmd.writeCubeIndicesU16(ptr);
             uploadStream.commit();
             ctx.flushImmediate();
+
+            var d = new VkShaderPipeline.GfxDesc();
+            d.name = "chunk-bounds";
+            d.vertGlsl = VkShaderSource.load("voxy:chunkoutline/outline.vsh", VkShaderSource.defs().props(properties).build());
+            d.fragGlsl = VkShaderSource.load("voxy:chunkoutline/outline.fsh", VkShaderSource.defs().props(properties).build());
+            d.colorFormat = VK_FORMAT_UNDEFINED;
+            d.depthFormat = VK_FORMAT_D32_SFLOAT;//the depth-bound image format
+            d.stencilFormat = VK_FORMAT_UNDEFINED;
+            d.depthTest = true;
+            d.depthWrite = true;
+            d.colorWrite = false;
+            //"further" compare: keep the farthest fragment (the AABB back face)
+            d.depthCompare = properties.isReverseZ() ? VK_COMPARE_OP_LESS : VK_COMPARE_OP_GREATER;
+            d.bindings = List.of(VkShaderPipeline.ubo(0), VkShaderPipeline.ssbo(1));
+            createdPipeline = new VkShaderPipeline(ctx, d);
+        } catch (RuntimeException | Error failure) {
+            if (createdPipeline != null) createdPipeline.free();
+            if (createdIndex != null) createdIndex.free();
+            if (createdUniform != null) createdUniform.free();
+            ctx.waitIdleRetireAll();
+            throw failure;
         }
 
-        var d = new VkShaderPipeline.GfxDesc();
-        d.name = "chunk-bounds";
-        d.vertGlsl = VkShaderSource.load("voxy:chunkoutline/outline.vsh", VkShaderSource.defs().props(properties).build());
-        d.fragGlsl = VkShaderSource.load("voxy:chunkoutline/outline.fsh", VkShaderSource.defs().props(properties).build());
-        d.colorFormat = VK_FORMAT_UNDEFINED;
-        d.depthFormat = VK_FORMAT_D32_SFLOAT;//the depth-bound image format
-        d.stencilFormat = VK_FORMAT_UNDEFINED;
-        d.depthTest = true;
-        d.depthWrite = true;
-        d.colorWrite = false;
-        //"further" compare: keep the farthest fragment (the AABB back face)
-        d.depthCompare = properties.isReverseZ() ? VK_COMPARE_OP_LESS : VK_COMPARE_OP_GREATER;
-        d.bindings = List.of(VkShaderPipeline.ubo(0), VkShaderPipeline.ssbo(1));
-        this.pipeline = new VkShaderPipeline(ctx, d);
+        this.uniform = createdUniform;
+        this.boxIndexBuffer = createdIndex;
+        this.pipeline = createdPipeline;
     }
 
     //Records the bound raster into the frame. The depth-bound image is cleared
@@ -109,16 +116,12 @@ public class VkBoundRenderer {
             }
 
             var cmd = this.ctx.cmd();
-            //uniform/chunk-pos uploads + the store's SSBO must be visible to the draw
             this.ctx.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
                     VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
         }
 
         var cmd = this.ctx.cmd();
-        //Transition depthBound from whatever layout the previous frame left it in
-        // (SHADER_READ_ONLY_OPTIMAL after the post-render transition below, or
-        // UNDEFINED on first frame) to DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
         viewport.depthBound.transition(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
@@ -128,7 +131,7 @@ public class VkBoundRenderer {
             var depthAttach = org.lwjgl.vulkan.VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(viewport.depthBound.view)
                     .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)//inline clear (inverseClearDepth) — saves the transfer-clear + tile load
+                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             depthAttach.clearValue().depthStencil().depth(this.properties.inverseClearDepth()).stencil(0);
             var info = org.lwjgl.vulkan.VkRenderingInfoKHR.calloc(stack).sType$Default()
