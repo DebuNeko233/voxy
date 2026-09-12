@@ -5,11 +5,11 @@ import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
+import me.cortex.voxy.client.core.model.bakery.IAtlasTextureReader;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.ViewportSelector;
-import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
-import me.cortex.voxy.client.core.model.bakery.IAtlasTextureReader;
 import me.cortex.voxy.client.core.rendering.bounding.StreamedBoundStore;
+import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.util.AbstractDownloadStream;
 import me.cortex.voxy.client.core.rendering.util.AbstractUploadStream;
@@ -19,6 +19,7 @@ import me.cortex.voxy.client.core.vk.VkAtlasTextureReader;
 import me.cortex.voxy.client.core.vk.VkBuffer;
 import me.cortex.voxy.client.core.vk.VkDownloadStream;
 import me.cortex.voxy.client.core.vk.VkFrameCtx;
+import me.cortex.voxy.client.core.vk.VkImage2D;
 import me.cortex.voxy.client.core.vk.VkUploadStream;
 import me.cortex.voxy.client.core.vk.VulkanBackend;
 import me.cortex.voxy.common.Logger;
@@ -31,15 +32,9 @@ import net.minecraft.client.Minecraft;
 import java.util.Arrays;
 import java.util.List;
 
-//The pure-Vulkan render core: constructed instead of the GL pipeline when MC
-// itself runs on Vulkan. Owns every GPU-facing subsystem (streams, geometry,
-// models, traversal, terrain renderer, compositor) on MC's adopted device, and
-// shares the CPU-side services (node manager, mesh generation, model bakery,
-// render-distance tracking) with the GL path.
-//
-//Everything records into MC's frame command buffer from the render hook
-// (MixinSodiumOpaqueVkFrame, TAIL of Sodium's opaque terrain draw), between
-// MC's opaque terrain pass and the rest of its frame. No OpenGL is touched.
+//Pure-Vulkan render core. Every field below is owned by this object; construction
+// is transactional so a failed shader/allocation cannot strand workers, global
+// backend singletons, or Vulkan allocations.
 public class VkRenderCore {
     private final WorldEngine worldIn;
     private final VkFrameCtx frameCtx;
@@ -59,76 +54,178 @@ public class VkRenderCore {
     private final VkSSAO ssao;
     private final VkBoundRenderer boundRenderer;
     private final StreamedBoundStore visibleSectionStream;
-    private boolean shutDown = false;
     private final RenderDistanceTracker renderDistanceTracker;
     private final ViewportSelector<VkViewport> viewportSelector;
+    private boolean shutDown = false;
 
     public VkRenderCore(WorldEngine world, ServiceManager sm) {
         world.acquireRef();
+        this.worldIn = world;
         Logger.info("Creating Voxy pure-Vulkan render core");
+
+        VkFrameCtx frame = null;
+        VkUploadStream upload = null;
+        VkDownloadStream download = null;
+        RenderProperties props = null;
+        VkModelStore models = null;
+        ModelBakerySubsystem modelBakery = null;
+        RenderGenerationService generation = null;
+        VkSectionGeometryData geometry = null;
+        AsyncNodeManager nodes = null;
+        VkNodeCleaner cleaner = null;
+        VkTraversal traverse = null;
+        VkTerrainRenderer terrain = null;
+        VkCompositor compose = null;
+        VkSSAO ao = null;
+        StreamedBoundStore visible = null;
+        VkBoundRenderer bounds = null;
+        ViewportSelector<VkViewport> viewports = null;
+        RenderDistanceTracker distanceTracker = null;
+
         try {
-            this.worldIn = world;
             var host = MinecraftVkHost.get();
             if (host == null) throw new IllegalStateException("No Minecraft Vulkan host adapter registered");
-            var vctx = VulkanBackend.context();//adopts MC's device
-            this.frameCtx = new VkFrameCtx(vctx);
+            var vctx = VulkanBackend.context();
+            frame = new VkFrameCtx(vctx);
 
-            //Install the VK streams BEFORE any shared class touches the singletons
-            this.uploadStream = new VkUploadStream(this.frameCtx, 1 << 26);//64 mb, same as GL
-            this.downloadStream = new VkDownloadStream(this.frameCtx, 1 << 25);//32 mb, same as GL
-            AbstractUploadStream.setInstance(this.uploadStream);
-            AbstractDownloadStream.setInstance(this.downloadStream);
+            upload = new VkUploadStream(frame, 1 << 26);
+            download = new VkDownloadStream(frame, 1 << 25);
+            AbstractUploadStream.setInstance(upload);
+            AbstractDownloadStream.setInstance(download);
 
-            this.properties = RenderProperties.getRenderProperties();
+            props = RenderProperties.getRenderProperties();
+            IAtlasTextureReader.setInstance(new VkAtlasTextureReader(frame));
 
-            //Install the VK atlas readback BEFORE the model bakery reads the block atlas
-            // (its constructor does a synchronous GPU->CPU copy)
-            IAtlasTextureReader.setInstance(
-                    new VkAtlasTextureReader(this.frameCtx));
-
-            this.modelStore = new VkModelStore(this.frameCtx, this.uploadStream);
-            this.modelService = new ModelBakerySubsystem(world.getMapper(), this.modelStore);
-            this.renderGen = new RenderGenerationService(world, this.modelService, sm, false);
+            models = new VkModelStore(frame, upload);
+            modelBakery = new ModelBakerySubsystem(world.getMapper(), models);
+            generation = new RenderGenerationService(world, modelBakery, sm, false);
 
             long geometryCapacity = vctx.recommendedGeometryCapacityBytes();
             Logger.info("Voxy VK geometry target: " + (geometryCapacity >> 20) + " MiB from "
                     + (vctx.deviceLocalHeapBytes >> 20) + " MiB device-local heap"
                     + (vctx.integratedGpu ? " (integrated GPU policy)" : " (discrete GPU policy)"));
-            this.geometryData = new VkSectionGeometryData(this.frameCtx, 1 << 20, geometryCapacity);
-            this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData, this.renderGen,
-                    new VkNodeGpuOps(this.frameCtx, this.uploadStream));
-            this.nodeCleaner = new VkNodeCleaner(this.frameCtx, this.uploadStream, this.downloadStream, this.nodeManager);
-            this.traversal = new VkTraversal(this.frameCtx, this.uploadStream, this.downloadStream,
-                    this.properties, this.nodeManager, this.nodeCleaner, this.renderGen);
-            this.terrainRenderer = new VkTerrainRenderer(this.frameCtx, this.uploadStream, this.downloadStream,
-                    this.properties, this.geometryData, this.modelStore);
-            this.compositor = new VkCompositor(this.frameCtx, this.uploadStream, this.properties,
-                    VoxyConfig.CONFIG.getFogMode().hasFog);
-            this.ssao = new VkSSAO(this.frameCtx, this.uploadStream, this.properties, VoxyConfig.CONFIG.getSSAOMode());
-            this.visibleSectionStream = new StreamedBoundStore(
-                    size -> new VkBuffer(this.frameCtx, size));
-            this.boundRenderer = new VkBoundRenderer(this.frameCtx, this.uploadStream, this.properties);
+            geometry = new VkSectionGeometryData(frame, 1 << 20, geometryCapacity);
+            nodes = new AsyncNodeManager(1 << 21, geometry, generation, new VkNodeGpuOps(frame, upload));
+            cleaner = new VkNodeCleaner(frame, upload, download, nodes);
+            traverse = new VkTraversal(frame, upload, download, props, nodes, cleaner, generation);
+            terrain = new VkTerrainRenderer(frame, upload, download, props, geometry, models);
+            compose = new VkCompositor(frame, upload, props, VoxyConfig.CONFIG.getFogMode().hasFog);
+            ao = new VkSSAO(frame, upload, props, VoxyConfig.CONFIG.getSSAOMode());
+            visible = new StreamedBoundStore(size -> new VkBuffer(frame, size));
+            bounds = new VkBoundRenderer(frame, upload, props);
 
-            world.setDirtyCallback(this.nodeManager::worldEvent);
-            Arrays.stream(world.getMapper().getBiomeEntries()).forEach(this.modelService::addBiome);
-            world.getMapper().setBiomeCallback(this.modelService::addBiome);
-            this.nodeManager.start();
+            world.setDirtyCallback(nodes::worldEvent);
+            Arrays.stream(world.getMapper().getBiomeEntries()).forEach(modelBakery::addBiome);
+            world.getMapper().setBiomeCallback(modelBakery::addBiome);
+            nodes.start();
 
-            this.viewportSelector = new ViewportSelector<>(() ->
-                    new VkViewport(this.frameCtx, this.properties, this.geometryData.getMaxSectionCount()));
+            final VkFrameCtx selectedFrame = frame;
+            final RenderProperties selectedProps = props;
+            final VkSectionGeometryData selectedGeometry = geometry;
+            viewports = new ViewportSelector<>(() ->
+                    new VkViewport(selectedFrame, selectedProps, selectedGeometry.getMaxSectionCount()));
 
             int minSec = Minecraft.getInstance().level.getMinSectionY() >> 5;
             int maxSec = (Minecraft.getInstance().level.getMaxSectionY() - 1) >> 5;
-            this.renderDistanceTracker = new RenderDistanceTracker(40, minSec, maxSec,
-                    this.nodeManager::addTopLevel, this.nodeManager::removeTopLevel);
-            this.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);
+            final AsyncNodeManager selectedNodes = nodes;
+            distanceTracker = new RenderDistanceTracker(40, minSec, maxSec,
+                    selectedNodes::addTopLevel, selectedNodes::removeTopLevel);
+            distanceTracker.setRenderDistance((int) Math.ceil(VoxyConfig.CONFIG.sectionRenderDistance + 1));
 
-            this.frameCtx.flushImmediate();
-            Logger.info("Voxy pure-Vulkan render core created with " + this.geometryData.getMaxCapacity() + " geometry capacity");
-        } catch (RuntimeException e) {
+            frame.flushImmediate();
+        } catch (RuntimeException | Error failure) {
+            //Stop producers and detach callbacks before touching the resources they
+            // feed. Run every cleanup step even if an earlier one itself fails.
+            try {
+                world.setDirtyCallback(null);
+                world.getMapper().setBiomeCallback(null);
+                world.getMapper().setStateCallback(null);
+            } catch (Throwable cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            if (nodes != null) {
+                try { nodes.stop(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (generation != null) {
+                try { generation.shutdown(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (frame != null) {
+                try { frame.waitIdleRetireAll(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+
+            //ModelBakerySubsystem owns VkModelStore once it has been constructed.
+            if (modelBakery != null) {
+                try { modelBakery.shutdown(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            } else if (models != null) {
+                try { models.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (bounds != null) {
+                try { bounds.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (visible != null) {
+                try { visible.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (traverse != null) {
+                try { traverse.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (cleaner != null) {
+                try { cleaner.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (terrain != null) {
+                try { terrain.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (ao != null) {
+                try { ao.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (compose != null) {
+                try { compose.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (viewports != null) {
+                try { viewports.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (geometry != null) {
+                try { geometry.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (download != null) {
+                try { download.flushWaitClear(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (upload != null) {
+                try { upload.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (download != null) {
+                try { download.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (frame != null) {
+                try { frame.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
+
+            AbstractUploadStream.clearInstance();
+            AbstractDownloadStream.clearInstance();
+            IAtlasTextureReader.clearInstance();
             world.releaseRef();
-            throw e;
+            throw failure;
         }
+
+        this.frameCtx = frame;
+        this.uploadStream = upload;
+        this.downloadStream = download;
+        this.properties = props;
+        this.modelStore = models;
+        this.modelService = modelBakery;
+        this.renderGen = generation;
+        this.geometryData = geometry;
+        this.nodeManager = nodes;
+        this.nodeCleaner = cleaner;
+        this.traversal = traverse;
+        this.terrainRenderer = terrain;
+        this.compositor = compose;
+        this.ssao = ao;
+        this.visibleSectionStream = visible;
+        this.boundRenderer = bounds;
+        this.viewportSelector = viewports;
+        this.renderDistanceTracker = distanceTracker;
+
+        Logger.info("Voxy pure-Vulkan render core created with " + this.geometryData.getMaxCapacity() + " geometry capacity");
     }
 
     public void renderFrame(RenderTarget target, MinecraftVkHostAdapter adapter, ChunkRenderMatrices matrices,
@@ -208,6 +305,8 @@ public class VkRenderCore {
         debug.add("VK host mode: " + VulkanBackend.statusLine());
         debug.add("VkBuf [#/logical MiB/allocated MiB]: [" + VkBuffer.getCount() + "/"
                 + (VkBuffer.getTotalSize() >> 20) + "/" + (VkBuffer.getTotalAllocationSize() >> 20) + "]");
+        debug.add("VkImage [#/allocated MiB]: [" + VkImage2D.getCount() + "/"
+                + (VkImage2D.getTotalAllocationSize() >> 20) + "]");
         debug.add("VkFrame [current/retired/inFlight/pendingDestroy/eventPool]: ["
                 + this.frameCtx.currentFrame() + "/" + this.frameCtx.retiredFrame() + "/"
                 + this.frameCtx.inFlightFrameCount() + "/" + this.frameCtx.pendingDestroyCount() + "/"
@@ -219,9 +318,7 @@ public class VkRenderCore {
     }
 
     public void shutdown() {
-        if (this.shutDown) {
-            return;
-        }
+        if (this.shutDown) return;
         this.shutDown = true;
         Logger.info("Shutting down Voxy pure-Vulkan render core");
 
@@ -264,7 +361,6 @@ public class VkRenderCore {
         AbstractUploadStream.clearInstance();
         AbstractDownloadStream.clearInstance();
         IAtlasTextureReader.clearInstance();
-
         this.worldIn.releaseRef();
         Logger.info("VK render core shutdown completed");
     }
