@@ -17,6 +17,9 @@ public interface IVkHost {
     VkQueue graphicsQueue();
     int graphicsQueueFamily();
 
+    /** Minecraft-owned VMA allocator associated with the adopted VkDevice. */
+    long vmaAllocator();
+
     /**
      * Minecraft's primary graphics command buffer for the current submission.
      * The host ensures one exists when Voxy asks at a safe, render-pass-free
