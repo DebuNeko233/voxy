@@ -4,6 +4,7 @@ import com.mojang.blaze3d.textures.GpuSampler;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
+import me.cortex.voxy.client.core.vk.compat.VitrailCompat;
 import me.cortex.voxy.client.core.vk.render.VkRenderCore;
 import me.cortex.voxy.common.Logger;
 import net.caffeinemc.mods.sodium.client.render.SodiumWorldRenderer;
@@ -39,6 +40,13 @@ public class MixinSodiumOpaqueVkFrame {
         if (this.voxy$failedVkCore.get() == core) return;
 
         try {
+            //Vitrail holds a Vulkan dynamic-rendering pass open across Sodium's
+            //terrain/sky/entity families and also re-enters this exact OPAQUE
+            //method for its shadow map. Close that held pass through Vitrail's
+            //own RenderPass object before any raw Voxy commands, and completely
+            //skip the shadow re-entry so it cannot be mistaken for a camera frame.
+            if (!VitrailCompat.prepareForWorldFrame()) return;
+
             core.renderFrame(group.outputTarget(), adapter, matrices, x, y, z);
             //If a new core replaced a previously failed one and renders
             //successfully, forget the old instance completely.
