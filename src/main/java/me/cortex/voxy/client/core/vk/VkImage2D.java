@@ -27,18 +27,17 @@ public final class VkImage2D {
     public final int width, height, mipLevels;
     public final int format;
     public final int aspect;
+    private final long allocationSize;
     private int currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    private boolean freed;
+
+    private static int COUNT;
+    private static long TOTAL_ALLOCATION_SIZE;
 
     public VkImage2D(VkFrameCtx ctx, int width, int height, int mipLevels, int format, int usage, int aspect, boolean perMipViews) {
         this(ctx, width, height, mipLevels, format, usage, aspect, perMipViews, null);
     }
 
-    //Creates a 2D image with optional VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT + a
-    // VkImageFormatListCreateInfo listing the formats the image will be viewed
-    // as. Required for sampling a depth-only aspect of a packed D32_SFLOAT_S8_UINT
-    // image on MoltenVK (so the depth-only view aliases the image without a
-    // separate staging texture). viewFormats may be null (no mutable-format
-    // flag, classic path).
     public VkImage2D(VkFrameCtx ctx, int width, int height, int mipLevels, int format, int usage, int aspect,
                      boolean perMipViews, int[] viewFormats) {
         this.ctx = ctx;
@@ -51,6 +50,7 @@ public final class VkImage2D {
 
         long createdImage = VK_NULL_HANDLE;
         long allocatedMemory = VK_NULL_HANDLE;
+        long allocatedBytes = 0;
         long createdView = VK_NULL_HANDLE;
         long[] createdMipViews = perMipViews ? new long[mipLevels] : null;
         try (MemoryStack stack = stackPush()) {
@@ -76,8 +76,9 @@ public final class VkImage2D {
 
             var req = VkMemoryRequirements.calloc(stack);
             vkGetImageMemoryRequirements(vctx.device, createdImage, req);
+            allocatedBytes = req.size();
             var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
-                    .allocationSize(req.size())
+                    .allocationSize(allocatedBytes)
                     .memoryTypeIndex(vctx.findMemoryType(req.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
             var pMem = stack.mallocLong(1);
             check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory(image)");
@@ -91,9 +92,6 @@ public final class VkImage2D {
                 }
             }
         } catch (RuntimeException | Error failure) {
-            //Image recreation happens during viewport resizes and renderer reloads.
-            //Keep construction transactional so an allocation/view failure cannot
-            //strand device memory or views and progressively increase VRAM usage.
             if (createdMipViews != null) {
                 for (long mipView : createdMipViews) {
                     if (mipView != VK_NULL_HANDLE) vkDestroyImageView(vctx.device, mipView, null);
@@ -109,6 +107,9 @@ public final class VkImage2D {
         this.memory = allocatedMemory;
         this.view = createdView;
         this.mipViews = createdMipViews;
+        this.allocationSize = allocatedBytes;
+        COUNT++;
+        TOTAL_ALLOCATION_SIZE += allocatedBytes;
     }
 
     private static long createView(MemoryStack stack, VulkanContext vctx, long image, int format, int aspect,
@@ -140,8 +141,6 @@ public final class VkImage2D {
         }
     }
 
-    //Batched transition: records multiple images' layout changes in a single
-    // vkCmdPipelineBarrier. UNDEFINED-layout images get TOP_OF_PIPE/0 (see transition()).
     public record BatchEntry(VkImage2D image, int newLayout, int srcAccess, int dstAccess) {}
     public static void transitionBatch(java.util.List<BatchEntry> entries, int unionSrcStage, int unionDstStage) {
         if (entries.isEmpty()) return;
@@ -182,7 +181,15 @@ public final class VkImage2D {
         }
     }
 
+    public long allocationSize() {
+        return this.allocationSize;
+    }
+
     public void free() {
+        if (this.freed) return;
+        this.freed = true;
+        COUNT--;
+        TOTAL_ALLOCATION_SIZE -= this.allocationSize;
         if (this.mipViews != null) {
             for (long v : this.mipViews) {
                 this.ctx.deferDestroyImage(0, v, 0);
@@ -194,9 +201,15 @@ public final class VkImage2D {
         this.ctx.deferDestroyImage(this.image, this.view, this.memory);
     }
 
-    /** Simple sampler factory (nearest/clamped or nearest-mipmap for HiZ etc).
-     *  Cached per Vulkan device so the ~9 call sites across the renderer share a
-     *  handful of sampler handles. */
+    public static int getCount() {
+        return COUNT;
+    }
+
+    public static long getTotalAllocationSize() {
+        return TOTAL_ALLOCATION_SIZE;
+    }
+
+    /** Simple sampler factory (nearest/clamped or nearest-mipmap for HiZ etc). */
     private record SamplerKey(long deviceAddress, boolean mipmapNearest, boolean linear) {}
     private static final java.util.Map<SamplerKey, Long> SAMPLER_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
