@@ -26,6 +26,7 @@ public final class VulkanContext {
     public final VkDevice device;
     public final VkQueue queue;
     public final int queueFamily;
+    public final long vmaAllocator;
     public final boolean hasDrawIndirectCount;
 
     private static final boolean ENABLE_SUBGROUP_PATHS = false;
@@ -53,6 +54,10 @@ public final class VulkanContext {
         this.device = host.device();
         this.queue = host.graphicsQueue();
         this.queueFamily = host.graphicsQueueFamily();
+        this.vmaAllocator = host.vmaAllocator();
+        if (this.vmaAllocator == 0L) {
+            throw new IllegalStateException("Minecraft Vulkan host exposed a null VMA allocator");
+        }
 
         //Physical-device support is not proof that Minecraft enabled this
         //optional feature on the adopted logical device, so stay on the
