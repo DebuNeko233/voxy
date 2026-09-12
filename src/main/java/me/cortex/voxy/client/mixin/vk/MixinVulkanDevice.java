@@ -30,12 +30,10 @@ public class MixinVulkanDevice {
     }
 
     @Inject(method = "close", at = @At("HEAD"))
-    private void voxy$shutdownBeforeDeviceClose(CallbackInfo ci) {
-        //This is the final safety net for shutdown ordering. LevelRenderer.close
-        //normally tears Voxy down first, but MC must never destroy its VkDevice
-        //while Voxy still owns buffers/images/pipelines or its command pool.
-        //Keep the host registered until teardown is complete so VkRenderCore can
-        //prove the adopted device is still alive and safely destroy its objects.
+    private void voxy$shutdownRendererBeforeDeviceClose(CallbackInfo ci) {
+        //Phase 1: stop Voxy while Minecraft's command encoder is still alive.
+        //VkBuffer/VkImage/VkPipeline frees can therefore enqueue destruction
+        //callbacks onto Blaze3D's submission-safe DestructionQueue.
         try {
             var holder = IVoxyRenderSystemHolder.getNullableHolder();
             if (holder != null) {
@@ -44,11 +42,25 @@ public class MixinVulkanDevice {
         } catch (Throwable t) {
             Logger.error("Voxy: failed to shut renderer down before Vulkan device close", t);
         }
+    }
 
+    @Inject(
+            method = "close",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lcom/mojang/blaze3d/vulkan/VulkanCommandEncoder;destroy()V",
+                    shift = At.Shift.AFTER
+            )
+    )
+    private void voxy$shutdownBackendAfterSubmissionDrain(CallbackInfo ci) {
+        //Phase 2: VulkanCommandEncoder.destroy() has waited the graphics queue
+        //idle and drained its destruction queues. Voxy can now destroy only its
+        //context-owned static caches and private immediate command pool without
+        //racing any submitted Minecraft command buffer.
         try {
             VulkanBackend.shutdown();
         } catch (Throwable t) {
-            Logger.error("Voxy: failed to release Vulkan backend before Minecraft device close", t);
+            Logger.error("Voxy: failed to release Vulkan backend after Minecraft submission drain", t);
         } finally {
             MinecraftVkHost.clear();
         }
