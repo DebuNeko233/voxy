@@ -15,11 +15,6 @@ import static me.cortex.voxy.common.util.AllocationArena.SIZE_LIMIT;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
-//Pure-VK implementation of the streaming upload contract: a persistently
-// mapped host-visible staging buffer + vkCmdCopyBuffer batches recorded into
-// the current frame commands at commit(). Staging space is recycled when the
-// frame that consumed it retires (VkFrameCtx events), mirroring the GL
-// fence-per-frame model 1:1.
 public class VkUploadStream extends AbstractUploadStream {
     private final VkFrameCtx ctx;
     private final VkBuffer stagingBuffer;
@@ -36,21 +31,29 @@ public class VkUploadStream extends AbstractUploadStream {
 
     public VkUploadStream(VkFrameCtx ctx, long size) {
         this.ctx = ctx;
-        this.stagingBuffer = new VkBuffer(ctx, size,
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
-        this.stagingPtr = this.stagingBuffer.map();
-        this.allocationArena.setLimit(size);
-        long minAlign = Math.max(16, ctx.vk().storageBufferOffsetAlignment());
-        //Also honour minUniformBufferOffsetAlignment defensively: uniform uploads
-        // are offset-0 today, but a packed-uniform sub-allocation path would break
-        // without this. storageBufferOffsetAlignment is typically >= uniformAlign
-        // so this is usually a no-op.
-        minAlign = Math.max(minAlign, ctx.vk().uniformBufferOffsetAlignment());
-        this.alignment = (int) minAlign;
+        VkBuffer staging = null;
+        long mapped = 0;
+        int resolvedAlignment = 0;
+        try {
+            staging = new VkBuffer(ctx, size,
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+            mapped = staging.map();
+            long minAlign = Math.max(16, ctx.vk().storageBufferOffsetAlignment());
+            minAlign = Math.max(minAlign, ctx.vk().uniformBufferOffsetAlignment());
+            if (minAlign > Integer.MAX_VALUE) throw new IllegalStateException("Vulkan staging alignment too large: " + minAlign);
+            resolvedAlignment = (int) minAlign;
+            this.allocationArena.setLimit(size);
+        } catch (RuntimeException | Error failure) {
+            if (staging != null) staging.free();
+            ctx.waitIdleRetireAll();
+            throw failure;
+        }
+        this.stagingBuffer = staging;
+        this.stagingPtr = mapped;
+        this.alignment = resolvedAlignment;
         ctx.addRetireListener(this::retireUpTo);
     }
 
-    /** VK handle of the staging buffer, for binding staged regions directly as SSBOs. */
     public long stagingBufferHandle() {
         return this.stagingBuffer.buffer;
     }
@@ -101,12 +104,6 @@ public class VkUploadStream extends AbstractUploadStream {
             return;
         }
         var cmd = this.ctx.cmd();
-        //Upload copies must not race preceding GPU writes of the destination
-        // buffers (the targets are compute/raster/transfer outputs), and must
-        // complete before the consuming compute/vertex/fragment stages read
-        // them. Scoped stage masks let unrelated GPU work overlap the copies,
-        // unlike the previous ALL_COMMANDS barriers which forced a full stall
-        // on every commit (~6/frame).
         this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
@@ -132,8 +129,6 @@ public class VkUploadStream extends AbstractUploadStream {
             this.frames.add(new UploadFrame(this.ctx.currentFrame(), new LongArrayList(this.thisFrameAllocations)));
             this.thisFrameAllocations.clear();
         }
-        //pollRetired() is called once at the end of each frame by VkRenderCore;
-        // polling here too was redundant (3x/frame) with no extra retirement benefit.
     }
 
     private void retireUpTo(long retiredFrame) {
