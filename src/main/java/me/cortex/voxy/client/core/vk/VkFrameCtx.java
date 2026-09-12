@@ -3,6 +3,7 @@ package me.cortex.voxy.client.core.vk;
 import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.util.vma.Vma;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkMemoryBarrier;
 
@@ -230,12 +231,22 @@ public final class VkFrameCtx {
         }
     }
 
+    /** Raw-allocation compatibility path retained until VkImage2D also moves to VMA. */
     public void deferDestroy(long buffer, long memory) {
         if (buffer == VK_NULL_HANDLE && memory == VK_NULL_HANDLE) return;
         this.queueNativeDestroy(() -> {
             if (buffer != VK_NULL_HANDLE) vkDestroyBuffer(this.ctx.device, buffer, null);
             if (memory != VK_NULL_HANDLE) vkFreeMemory(this.ctx.device, memory, null);
         });
+    }
+
+    /** Destroy a buffer suballocated from Minecraft's VMA only after its submission retires. */
+    public void deferDestroyVmaBuffer(long buffer, long allocation) {
+        if (buffer == VK_NULL_HANDLE && allocation == VK_NULL_HANDLE) return;
+        if (buffer == VK_NULL_HANDLE || allocation == VK_NULL_HANDLE) {
+            throw new IllegalArgumentException("Incomplete VMA buffer handle pair");
+        }
+        this.queueNativeDestroy(() -> Vma.vmaDestroyBuffer(this.ctx.vmaAllocator, buffer, allocation));
     }
 
     public void deferDestroyImage(long image, long view, long memory) {
