@@ -1,12 +1,13 @@
 package me.cortex.voxy.client.core.vk;
 
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.util.vma.Vma;
+import org.lwjgl.util.vma.VmaAllocationCreateInfo;
+import org.lwjgl.util.vma.VmaAllocationInfo;
 import org.lwjgl.vulkan.VkImageCreateInfo;
 import org.lwjgl.vulkan.VkImageFormatListCreateInfo;
 import org.lwjgl.vulkan.VkImageMemoryBarrier;
 import org.lwjgl.vulkan.VkImageViewCreateInfo;
-import org.lwjgl.vulkan.VkMemoryAllocateInfo;
-import org.lwjgl.vulkan.VkMemoryRequirements;
 import org.lwjgl.vulkan.VkSamplerCreateInfo;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
@@ -14,14 +15,14 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
 //2D image + full view (+ optional per-mip views) for the pure-VK path:
-// offscreen colour/depth targets, the HiZ mip pyramid, and the model atlas.
-// Tracks the current layout for whole-image transitions (Voxy transitions
-// whole subresource ranges only, keeping parity with the GL path's coarse
-// barrier usage).
+//offscreen colour/depth targets, the HiZ mip pyramid, and the model atlas.
+//Memory is suballocated from Minecraft's existing VMA allocator instead of
+//creating one VkDeviceMemory object per image. Tracks the current layout for
+//whole-image transitions (Voxy transitions whole subresource ranges only).
 public final class VkImage2D {
     private final VkFrameCtx ctx;
     public final long image;
-    public final long memory;
+    public final long allocation;
     public final long view;
     public final long[] mipViews;//null unless requested
     public final int width, height, mipLevels;
@@ -49,7 +50,7 @@ public final class VkImage2D {
         var vctx = ctx.vk();
 
         long createdImage = VK_NULL_HANDLE;
-        long allocatedMemory = VK_NULL_HANDLE;
+        long createdAllocation = VK_NULL_HANDLE;
         long allocatedBytes = 0;
         long createdView = VK_NULL_HANDLE;
         long[] createdMipViews = perMipViews ? new long[mipLevels] : null;
@@ -70,20 +71,21 @@ public final class VkImage2D {
                         .pViewFormats(stack.ints(viewFormats));
                 ici.pNext(formatList.address());
             }
-            var pImg = stack.mallocLong(1);
-            check(vkCreateImage(vctx.device, ici, null, pImg), "vkCreateImage");
-            createdImage = pImg.get(0);
 
-            var req = VkMemoryRequirements.calloc(stack);
-            vkGetImageMemoryRequirements(vctx.device, createdImage, req);
-            allocatedBytes = req.size();
-            var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
-                    .allocationSize(allocatedBytes)
-                    .memoryTypeIndex(vctx.findMemoryType(req.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-            var pMem = stack.mallocLong(1);
-            check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory(image)");
-            allocatedMemory = pMem.get(0);
-            check(vkBindImageMemory(vctx.device, createdImage, allocatedMemory, 0), "vkBindImageMemory");
+            //Mirror Minecraft 26.2's VulkanGpuTexture allocator strategy: VMA
+            //chooses/suballocates device-preferred memory from the allocator
+            //owned by the adopted VulkanDevice.
+            var aci = VmaAllocationCreateInfo.calloc(stack)
+                    .usage(Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE)
+                    .preferredFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            var pImg = stack.mallocLong(1);
+            var pAllocation = stack.mallocPointer(1);
+            var allocationInfo = VmaAllocationInfo.calloc(stack);
+            check(Vma.vmaCreateImage(vctx.vmaAllocator, ici, aci, pImg, pAllocation, allocationInfo),
+                    "vmaCreateImage");
+            createdImage = pImg.get(0);
+            createdAllocation = pAllocation.get(0);
+            allocatedBytes = allocationInfo.size();
 
             createdView = createView(stack, vctx, createdImage, format, aspect, 0, mipLevels);
             if (createdMipViews != null) {
@@ -98,13 +100,14 @@ public final class VkImage2D {
                 }
             }
             if (createdView != VK_NULL_HANDLE) vkDestroyImageView(vctx.device, createdView, null);
-            if (createdImage != VK_NULL_HANDLE) vkDestroyImage(vctx.device, createdImage, null);
-            if (allocatedMemory != VK_NULL_HANDLE) vkFreeMemory(vctx.device, allocatedMemory, null);
+            if (createdImage != VK_NULL_HANDLE && createdAllocation != VK_NULL_HANDLE) {
+                Vma.vmaDestroyImage(vctx.vmaAllocator, createdImage, createdAllocation);
+            }
             throw failure;
         }
 
         this.image = createdImage;
-        this.memory = allocatedMemory;
+        this.allocation = createdAllocation;
         this.view = createdView;
         this.mipViews = createdMipViews;
         this.allocationSize = allocatedBytes;
@@ -190,15 +193,18 @@ public final class VkImage2D {
         this.freed = true;
         COUNT--;
         TOTAL_ALLOCATION_SIZE -= this.allocationSize;
+
+        int mipCount = this.mipViews == null ? 0 : this.mipViews.length;
+        long[] additionalViews = new long[mipCount + this.extraViews.size()];
+        int index = 0;
         if (this.mipViews != null) {
-            for (long v : this.mipViews) {
-                this.ctx.deferDestroyImage(0, v, 0);
-            }
+            for (long mipView : this.mipViews) additionalViews[index++] = mipView;
         }
-        for (long v : this.extraViews) {
-            this.ctx.deferDestroyImage(0, v, 0);
-        }
-        this.ctx.deferDestroyImage(this.image, this.view, this.memory);
+        for (long extraView : this.extraViews) additionalViews[index++] = extraView;
+
+        //Destroy every view before returning the image allocation to VMA, all in
+        //one Minecraft submission-retirement callback.
+        this.ctx.deferDestroyVmaImage(this.image, this.view, this.allocation, additionalViews);
     }
 
     public static int getCount() {
