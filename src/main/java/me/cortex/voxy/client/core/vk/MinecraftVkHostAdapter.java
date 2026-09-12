@@ -29,7 +29,14 @@ public final class MinecraftVkHostAdapter implements IVkHost {
 
     @Override
     public VkCommandBuffer frameCommandBuffer() {
-        return ((AccessorVulkanCommandEncoder) (Object) this.encoder()).voxy$currentCommandBuffer();
+        var accessor = (AccessorVulkanCommandEncoder) (Object) this.encoder();
+        var current = accessor.voxy$currentCommandBuffer();
+        //Sodium may legitimately draw no vanilla chunk batches. In that case
+        //Blaze3D may not have needed a command buffer yet, but Voxy still has LOD
+        //work to record. The hook is after Sodium's RenderPass has closed, so use
+        //Minecraft's own private commandBuffer() path to allocate/begin/attach a
+        //primary command buffer to the current submission instead of skipping.
+        return current != null ? current : accessor.voxy$ensureCommandBuffer();
     }
 
     @Override
