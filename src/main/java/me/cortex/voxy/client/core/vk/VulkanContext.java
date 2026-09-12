@@ -3,7 +3,7 @@ package me.cortex.voxy.client.core.vk;
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK11;
-import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
+import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkPhysicalDevice;
@@ -13,13 +13,12 @@ import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceSubgroupProperties;
 import org.lwjgl.vulkan.VkQueue;
 
-import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
 //Wraps Minecraft's already-created Vulkan device. Voxy never creates or
-// reconfigures the logical device, so optional features are usable only when
-// Minecraft itself is known to have enabled them.
+//reconfigures the logical device and no longer owns a graphics command pool:
+//all primary recording/submission is routed through Minecraft's encoder.
 public final class VulkanContext {
     private final IVkHost host;
     public final VkInstance instance;
@@ -43,7 +42,6 @@ public final class VulkanContext {
     public final boolean integratedGpu;
     public final long deviceLocalHeapBytes;
     public final boolean needsSampleMaskDiscard;
-    public final long commandPool;
     private VkPhysicalDeviceSubgroupProperties subgroupProps;
 
     public static VulkanContext adopt(IVkHost host) { return new VulkanContext(host); }
@@ -57,8 +55,8 @@ public final class VulkanContext {
         this.queueFamily = host.graphicsQueueFamily();
 
         //Physical-device support is not proof that Minecraft enabled this
-        // optional feature on the adopted logical device, so stay on the
-        // fixed-count compatibility path until Blaze3D exposes that fact.
+        //optional feature on the adopted logical device, so stay on the
+        //fixed-count compatibility path until Blaze3D exposes that fact.
         this.hasDrawIndirectCount = false;
 
         var subgroup = querySubgroupProperties(this.physicalDevice);
@@ -76,7 +74,6 @@ public final class VulkanContext {
         int vendorId;
         boolean integrated;
         long localHeapBytes = 0;
-        long createdCommandPool = VK_NULL_HANDLE;
         try (MemoryStack stack = stackPush()) {
             var props = VkPhysicalDeviceProperties.calloc(stack);
             vkGetPhysicalDeviceProperties(this.physicalDevice, props);
@@ -92,25 +89,13 @@ public final class VulkanContext {
                     localHeapBytes = Math.max(localHeapBytes, heap.size());
                 }
             }
-
-            var cpci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()
-                    .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
-                    .queueFamilyIndex(this.queueFamily);
-            var pPool = stack.callocLong(1);
-            int result = vkCreateCommandPool(this.device, cpci, null, pPool);
-            createdCommandPool = pPool.get(0);
-            check(result, "vkCreateCommandPool(adopted)");
         } catch (RuntimeException | Error failure) {
-            if (createdCommandPool != VK_NULL_HANDLE) {
-                vkDestroyCommandPool(this.device, createdCommandPool, null);
-            }
             if (this.subgroupProps != null) {
                 this.subgroupProps.free();
                 this.subgroupProps = null;
             }
             throw failure;
         }
-        this.commandPool = createdCommandPool;
         this.integratedGpu = integrated;
         this.deviceLocalHeapBytes = localHeapBytes;
         boolean macOS = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac");
@@ -124,6 +109,16 @@ public final class VulkanContext {
                 + ", subgroupArithmetic=" + this.subgroupArithmetic
                 + " (deviceCapable=" + deviceSupportsSubgroups + ", gate=" + ENABLE_SUBGROUP_PATHS + ")"
                 + ", subgroupSize=" + this.subgroupSize + ")");
+    }
+
+    /** Minecraft-owned command buffer for the current graphics submission. */
+    public VkCommandBuffer hostCommandBuffer() {
+        return this.host.frameCommandBuffer();
+    }
+
+    /** Submit and synchronously wait for the current Minecraft encoder batch. */
+    public void submitAndWaitCurrent() {
+        this.host.submitAndWaitCurrent();
     }
 
     /**
@@ -200,7 +195,6 @@ public final class VulkanContext {
         vkDeviceWaitIdle(this.device);
         VkImage2D.destroySamplers(this);
         VkShaderPipeline.destroyCachedLayouts(this);
-        vkDestroyCommandPool(this.device, this.commandPool, null);
         if (this.subgroupProps != null) {
             this.subgroupProps.free();
             this.subgroupProps = null;
