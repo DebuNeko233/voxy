@@ -49,6 +49,14 @@ public class VkDownloadStream extends AbstractDownloadStream {
         ctx.addRetireListener(this::retireUpTo);
     }
 
+    public long stagingArenaBytes() {
+        return this.allocationArena.getSize();
+    }
+
+    public int pendingFrameCount() {
+        return this.frames.size();
+    }
+
     @Override
     public void download(IDeviceBuffer buffer, long downloadOffset, long size, DownloadResultConsumer resultConsumer) {
         if (!(buffer instanceof VkBuffer vkBuffer)) throw new IllegalArgumentException("Vulkan download requires a VkBuffer source");
