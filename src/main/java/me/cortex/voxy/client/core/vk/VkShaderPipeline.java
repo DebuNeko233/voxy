@@ -54,18 +54,33 @@ public final class VkShaderPipeline {
         this.compute = true;
         this.pushStages = VK_SHADER_STAGE_COMPUTE_BIT;
         var vctx = ctx.vk();
-        try (MemoryStack stack = stackPush()) {
-            long module = createModule(vctx, ShadercCompiler.compile(computeGlsl, ShaderType.COMPUTE, name), stack);
-            this.modules = new long[]{module};
-            this.descriptorSetLayout = createSetLayout(vctx, stack, bindings, VK_SHADER_STAGE_COMPUTE_BIT);
-            this.pipelineLayout = createPipelineLayout(vctx, stack, this.descriptorSetLayout, pushConstantBytes, VK_SHADER_STAGE_COMPUTE_BIT);
 
-            var cpci = VkComputePipelineCreateInfo.calloc(1, stack).sType$Default().layout(this.pipelineLayout);
+        long module = VK_NULL_HANDLE;
+        long setLayout = VK_NULL_HANDLE;
+        long createdPipelineLayout = VK_NULL_HANDLE;
+        long createdPipeline = VK_NULL_HANDLE;
+        try (MemoryStack stack = stackPush()) {
+            module = createModule(vctx, ShadercCompiler.compile(computeGlsl, ShaderType.COMPUTE, name), stack);
+            setLayout = createSetLayout(vctx, stack, bindings, VK_SHADER_STAGE_COMPUTE_BIT);
+            createdPipelineLayout = createPipelineLayout(vctx, stack, setLayout, pushConstantBytes, VK_SHADER_STAGE_COMPUTE_BIT);
+
+            var cpci = VkComputePipelineCreateInfo.calloc(1, stack).sType$Default().layout(createdPipelineLayout);
             cpci.stage().sType$Default().stage(VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(stack.UTF8("main"));
-            var pPipe = stack.mallocLong(1);
-            check(vkCreateComputePipelines(vctx.device, VK_NULL_HANDLE, cpci, null, pPipe), "vkCreateComputePipelines(" + name + ")");
-            this.pipeline = pPipe.get(0);
+            var pPipe = stack.callocLong(1);
+            int result = vkCreateComputePipelines(vctx.device, VK_NULL_HANDLE, cpci, null, pPipe);
+            createdPipeline = pPipe.get(0);
+            check(result, "vkCreateComputePipelines(" + name + ")");
+        } catch (RuntimeException | Error failure) {
+            if (createdPipeline != VK_NULL_HANDLE) vkDestroyPipeline(vctx.device, createdPipeline, null);
+            if (createdPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(vctx.device, createdPipelineLayout, null);
+            if (module != VK_NULL_HANDLE) vkDestroyShaderModule(vctx.device, module, null);
+            throw failure;
         }
+
+        this.modules = new long[]{module};
+        this.descriptorSetLayout = setLayout;
+        this.pipelineLayout = createdPipelineLayout;
+        this.pipeline = createdPipeline;
     }
 
     //=============================== Graphics ===============================
@@ -101,12 +116,17 @@ public final class VkShaderPipeline {
         this.compute = false;
         this.pushStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         var vctx = ctx.vk();
+
+        long vertModule = VK_NULL_HANDLE;
+        long fragModule = VK_NULL_HANDLE;
+        long setLayout = VK_NULL_HANDLE;
+        long createdPipelineLayout = VK_NULL_HANDLE;
+        long createdPipeline = VK_NULL_HANDLE;
         try (MemoryStack stack = stackPush()) {
-            long vertModule = createModule(vctx, ShadercCompiler.compile(d.vertGlsl, ShaderType.VERTEX, d.name + ".vert"), stack);
-            long fragModule = createModule(vctx, ShadercCompiler.compile(d.fragGlsl, ShaderType.FRAGMENT, d.name + ".frag"), stack);
-            this.modules = new long[]{vertModule, fragModule};
-            this.descriptorSetLayout = createSetLayout(vctx, stack, d.bindings, this.pushStages);
-            this.pipelineLayout = createPipelineLayout(vctx, stack, this.descriptorSetLayout, d.pushConstantBytes, this.pushStages);
+            vertModule = createModule(vctx, ShadercCompiler.compile(d.vertGlsl, ShaderType.VERTEX, d.name + ".vert"), stack);
+            fragModule = createModule(vctx, ShadercCompiler.compile(d.fragGlsl, ShaderType.FRAGMENT, d.name + ".frag"), stack);
+            setLayout = createSetLayout(vctx, stack, d.bindings, this.pushStages);
+            createdPipelineLayout = createPipelineLayout(vctx, stack, setLayout, d.pushConstantBytes, this.pushStages);
 
             var stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
             stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertModule).pName(stack.UTF8("main"));
@@ -175,11 +195,23 @@ public final class VkShaderPipeline {
                     .pDepthStencilState(depthState)
                     .pColorBlendState(blend)
                     .pDynamicState(dynamicState)
-                    .layout(this.pipelineLayout);
-            var pPipe = stack.mallocLong(1);
-            check(vkCreateGraphicsPipelines(vctx.device, VK_NULL_HANDLE, gpci, null, pPipe), "vkCreateGraphicsPipelines(" + d.name + ")");
-            this.pipeline = pPipe.get(0);
+                    .layout(createdPipelineLayout);
+            var pPipe = stack.callocLong(1);
+            int result = vkCreateGraphicsPipelines(vctx.device, VK_NULL_HANDLE, gpci, null, pPipe);
+            createdPipeline = pPipe.get(0);
+            check(result, "vkCreateGraphicsPipelines(" + d.name + ")");
+        } catch (RuntimeException | Error failure) {
+            if (createdPipeline != VK_NULL_HANDLE) vkDestroyPipeline(vctx.device, createdPipeline, null);
+            if (createdPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(vctx.device, createdPipelineLayout, null);
+            if (fragModule != VK_NULL_HANDLE) vkDestroyShaderModule(vctx.device, fragModule, null);
+            if (vertModule != VK_NULL_HANDLE) vkDestroyShaderModule(vctx.device, vertModule, null);
+            throw failure;
         }
+
+        this.modules = new long[]{vertModule, fragModule};
+        this.descriptorSetLayout = setLayout;
+        this.pipelineLayout = createdPipelineLayout;
+        this.pipeline = createdPipeline;
     }
 
     //=============================== Shared ===============================
