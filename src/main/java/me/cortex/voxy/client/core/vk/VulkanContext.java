@@ -151,6 +151,11 @@ public final class VulkanContext {
         this.host.deferUntilSubmissionComplete(action);
     }
 
+    /** Advance every host destruction slot through Minecraft's own submit path. */
+    public void drainDeferredDestruction() {
+        this.host.drainDeferredDestruction();
+    }
+
     private static VkPhysicalDeviceSubgroupProperties querySubgroupProperties(VkPhysicalDevice pd) {
         try (MemoryStack stack = stackPush()) {
             var sg = VkPhysicalDeviceSubgroupProperties.calloc(stack).sType$Default();
