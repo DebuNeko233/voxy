@@ -58,6 +58,14 @@ public class VkUploadStream extends AbstractUploadStream {
         return this.stagingBuffer.buffer;
     }
 
+    public long stagingArenaBytes() {
+        return this.allocationArena.getSize();
+    }
+
+    public int pendingFrameCount() {
+        return this.frames.size();
+    }
+
     @Override
     public long upload(IDeviceBuffer buffer, long destOffset, long size) {
         if (size <= 0 || size > Integer.MAX_VALUE) throw new IllegalArgumentException("Invalid Vulkan upload size: " + size);
@@ -94,7 +102,6 @@ public class VkUploadStream extends AbstractUploadStream {
             addr = this.caddr + this.offset;
             this.offset += size;
         }
-        //Check the full coalesced allocation, not just the latest increment.
         if (this.caddr + this.offset > this.stagingBuffer.size()) throw new IllegalStateException("Vulkan upload staging allocation exceeded buffer");
         return addr;
     }
