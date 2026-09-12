@@ -7,12 +7,10 @@ import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkPhysicalDevice;
-import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceSubgroupProperties;
-import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.lwjgl.vulkan.VkQueue;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
@@ -20,11 +18,9 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK11.*;
 
-//Wraps the Vulkan device Voxy renders on. Voxy never creates its own device:
-// when MC 26.2 runs on its native Vulkan backend, Voxy ADOPTS the game's
-// VkInstance/VkDevice/queue via IVkHost and allocates only its own command pool.
-// MC owns (and destroys) the device/instance, so destroy() tears down only the
-// resources Voxy created on the adopted device.
+//Wraps Minecraft's already-created Vulkan device. Voxy never creates or
+// reconfigures the logical device, so optional features are usable only when
+// Minecraft itself is known to have enabled them.
 public final class VulkanContext {
     public final VkInstance instance;
     public final VkPhysicalDevice physicalDevice;
@@ -32,7 +28,7 @@ public final class VulkanContext {
     public final VkQueue queue;
     public final int queueFamily;
     public final boolean hasDrawIndirectCount;
-    //MASTER SWITCH for every subgroup-dependent VK path. Keep FALSE.
+
     private static final boolean ENABLE_SUBGROUP_PATHS = false;
 
     public final boolean subgroupArithmetic;
@@ -52,7 +48,16 @@ public final class VulkanContext {
         this.device = host.device();
         this.queue = host.graphicsQueue();
         this.queueFamily = host.graphicsQueueFamily();
-        this.hasDrawIndirectCount = queryDrawIndirectCount(this.physicalDevice);
+
+        //Important: vkGetPhysicalDeviceFeatures2 reports what the PHYSICAL device
+        // supports, not which optional features Minecraft enabled when creating
+        // this adopted VkDevice. Vulkan requires drawIndirectCount to be enabled
+        // in VkDeviceCreateInfo before vkCmdDraw*IndirectCount can be used. MC
+        // 26.2 exposes no enabled-feature bit for drawIndirectCount, so the only
+        // correct default is the fixed-count fallback. This can be promoted to a
+        // fast path later if Blaze3D exposes a reliable enabled-feature signal.
+        this.hasDrawIndirectCount = false;
+
         var subgroup = querySubgroupProperties(this.physicalDevice);
         this.subgroupProps = subgroup;
         this.subgroupSize = subgroup != null ? subgroup.subgroupSize() : 1;
@@ -63,10 +68,12 @@ public final class VulkanContext {
                 && (stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0
                 && this.subgroupSize >= 16;
         this.subgroupArithmetic = ENABLE_SUBGROUP_PATHS && deviceSupportsSubgroups;
+
         String name;
         int vendorId;
         boolean integrated;
         long localHeapBytes = 0;
+        long createdCommandPool = VK_NULL_HANDLE;
         try (MemoryStack stack = stackPush()) {
             var props = VkPhysicalDeviceProperties.calloc(stack);
             vkGetPhysicalDeviceProperties(this.physicalDevice, props);
@@ -86,32 +93,34 @@ public final class VulkanContext {
             var cpci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()
                     .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
                     .queueFamilyIndex(this.queueFamily);
-            var pPool = stack.mallocLong(1);
-            check(vkCreateCommandPool(this.device, cpci, null, pPool), "vkCreateCommandPool(adopted)");
-            this.commandPool = pPool.get(0);
+            var pPool = stack.callocLong(1);
+            int result = vkCreateCommandPool(this.device, cpci, null, pPool);
+            createdCommandPool = pPool.get(0);
+            check(result, "vkCreateCommandPool(adopted)");
+        } catch (RuntimeException | Error failure) {
+            if (createdCommandPool != VK_NULL_HANDLE) {
+                vkDestroyCommandPool(this.device, createdCommandPool, null);
+            }
+            if (this.subgroupProps != null) {
+                this.subgroupProps.free();
+                this.subgroupProps = null;
+            }
+            throw failure;
         }
+        this.commandPool = createdCommandPool;
         this.integratedGpu = integrated;
         this.deviceLocalHeapBytes = localHeapBytes;
         boolean macOS = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac");
-        this.needsSampleMaskDiscard = macOS && vendorId != 0x106B;//Apple's PCI vendor id
+        this.needsSampleMaskDiscard = macOS && vendorId != 0x106B;
         this.deviceName = name + " (MC host)";
         Logger.info("Voxy Vulkan context adopted Minecraft device: " + this.deviceName
-                + " (drawIndirectCount=" + this.hasDrawIndirectCount
+                + " (drawIndirectCount=" + this.hasDrawIndirectCount + " [conservative adopted-device policy]"
                 + ", integratedGpu=" + this.integratedGpu
                 + ", deviceLocalHeapMiB=" + (this.deviceLocalHeapBytes >> 20)
                 + ", sampleMaskDiscard=" + this.needsSampleMaskDiscard
                 + ", subgroupArithmetic=" + this.subgroupArithmetic
                 + " (deviceCapable=" + deviceSupportsSubgroups + ", gate=" + ENABLE_SUBGROUP_PATHS + ")"
                 + ", subgroupSize=" + this.subgroupSize + ")");
-    }
-
-    private static boolean queryDrawIndirectCount(VkPhysicalDevice pd) {
-        try (MemoryStack stack = stackPush()) {
-            var f12q = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default();
-            var f2 = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(f12q);
-            VK11.vkGetPhysicalDeviceFeatures2(pd, f2);
-            return f12q.drawIndirectCount();
-        }
     }
 
     private static VkPhysicalDeviceSubgroupProperties querySubgroupProperties(VkPhysicalDevice pd) {
@@ -177,8 +186,6 @@ public final class VulkanContext {
 
     public void destroy() {
         vkDeviceWaitIdle(this.device);
-        //Static native-object caches are owned by the adopted device, not by an
-        //individual world renderer. Tear them down before MC destroys VkDevice.
         VkImage2D.destroySamplers(this);
         VkShaderPipeline.destroyCachedLayouts(this);
         vkDestroyCommandPool(this.device, this.commandPool, null);
