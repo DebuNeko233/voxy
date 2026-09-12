@@ -41,13 +41,38 @@ public class VkViewport extends Viewport<VkViewport> {
     public VkViewport(VkFrameCtx ctx, RenderProperties properties, int maxSectionCount) {
         super(properties);
         this.ctx = ctx;
-        this.drawCountCallBuffer = new VkBuffer(ctx, 1024).zero();
-        this.drawCallBuffer = new VkBuffer(ctx, 5L * 4 * (OPAQUE_DRAW_COUNT + TRANSLUCENT_DRAW_COUNT + TEMPORAL_DRAW_COUNT)).zero();
-        this.positionScratchBuffer = new VkBuffer(ctx, 8L * 400000).zero();
-        this.indirectLookupBuffer = new VkBuffer(ctx, HierarchicalOcclusionTraverser.MAX_QUEUE_SIZE * 4L + 4).zero();
-        this.visibilityBuffer = new VkBuffer(ctx, maxSectionCount * 4L).zero();
-        this.hiZ = new VkHiZ(ctx, properties);
-        ctx.flushImmediate();
+
+        VkBuffer createdDrawCount = null;
+        VkBuffer createdDrawCalls = null;
+        VkBuffer createdPositionScratch = null;
+        VkBuffer createdIndirectLookup = null;
+        VkBuffer createdVisibility = null;
+        VkHiZ createdHiZ = null;
+        try {
+            createdDrawCount = new VkBuffer(ctx, 1024).zero();
+            createdDrawCalls = new VkBuffer(ctx, 5L * 4 * (OPAQUE_DRAW_COUNT + TRANSLUCENT_DRAW_COUNT + TEMPORAL_DRAW_COUNT)).zero();
+            createdPositionScratch = new VkBuffer(ctx, 8L * 400000).zero();
+            createdIndirectLookup = new VkBuffer(ctx, HierarchicalOcclusionTraverser.MAX_QUEUE_SIZE * 4L + 4).zero();
+            createdVisibility = new VkBuffer(ctx, maxSectionCount * 4L).zero();
+            createdHiZ = new VkHiZ(ctx, properties);
+            ctx.flushImmediate();
+        } catch (RuntimeException | Error failure) {
+            if (createdHiZ != null) createdHiZ.free();
+            if (createdVisibility != null) createdVisibility.free();
+            if (createdIndirectLookup != null) createdIndirectLookup.free();
+            if (createdPositionScratch != null) createdPositionScratch.free();
+            if (createdDrawCalls != null) createdDrawCalls.free();
+            if (createdDrawCount != null) createdDrawCount.free();
+            ctx.waitIdleRetireAll();
+            throw failure;
+        }
+
+        this.drawCountCallBuffer = createdDrawCount;
+        this.drawCallBuffer = createdDrawCalls;
+        this.positionScratchBuffer = createdPositionScratch;
+        this.indirectLookupBuffer = createdIndirectLookup;
+        this.visibilityBuffer = createdVisibility;
+        this.hiZ = createdHiZ;
     }
 
     @Override
