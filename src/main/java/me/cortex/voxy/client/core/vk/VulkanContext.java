@@ -2,6 +2,8 @@ package me.cortex.voxy.client.core.vk;
 
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.util.vma.Vma;
+import org.lwjgl.util.vma.VmaBudget;
 import org.lwjgl.vulkan.VK11;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDevice;
@@ -18,8 +20,11 @@ import static org.lwjgl.vulkan.VK10.*;
 
 //Wraps Minecraft's already-created Vulkan device. Voxy never creates or
 //reconfigures the logical device and no longer owns a graphics command pool:
-//all primary recording/submission is routed through Minecraft's encoder.
+//all primary recording/submission and memory allocation are routed through
+//Minecraft's encoder and VMA allocator.
 public final class VulkanContext {
+    private static final long MIB = 1024L * 1024L;
+
     private final IVkHost host;
     public final VkInstance instance;
     public final VkPhysicalDevice physicalDevice;
@@ -42,6 +47,7 @@ public final class VulkanContext {
     public final String deviceName;
     public final boolean integratedGpu;
     public final long deviceLocalHeapBytes;
+    public final int deviceLocalHeapIndex;
     public final boolean needsSampleMaskDiscard;
     private VkPhysicalDeviceSubgroupProperties subgroupProps;
 
@@ -79,6 +85,7 @@ public final class VulkanContext {
         int vendorId;
         boolean integrated;
         long localHeapBytes = 0;
+        int localHeapIndex = -1;
         try (MemoryStack stack = stackPush()) {
             var props = VkPhysicalDeviceProperties.calloc(stack);
             vkGetPhysicalDeviceProperties(this.physicalDevice, props);
@@ -90,8 +97,9 @@ public final class VulkanContext {
             vkGetPhysicalDeviceMemoryProperties(this.physicalDevice, memProps);
             for (int i = 0; i < memProps.memoryHeapCount(); i++) {
                 var heap = memProps.memoryHeaps(i);
-                if ((heap.flags() & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
-                    localHeapBytes = Math.max(localHeapBytes, heap.size());
+                if ((heap.flags() & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 && heap.size() > localHeapBytes) {
+                    localHeapBytes = heap.size();
+                    localHeapIndex = i;
                 }
             }
         } catch (RuntimeException | Error failure) {
@@ -101,8 +109,16 @@ public final class VulkanContext {
             }
             throw failure;
         }
+        if (localHeapIndex < 0) {
+            if (this.subgroupProps != null) {
+                this.subgroupProps.free();
+                this.subgroupProps = null;
+            }
+            throw new IllegalStateException("Vulkan device exposes no device-local memory heap");
+        }
         this.integratedGpu = integrated;
         this.deviceLocalHeapBytes = localHeapBytes;
+        this.deviceLocalHeapIndex = localHeapIndex;
         boolean macOS = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac");
         this.needsSampleMaskDiscard = macOS && vendorId != 0x106B;
         this.deviceName = name + " (MC host)";
@@ -170,30 +186,53 @@ public final class VulkanContext {
         return this.uniformAlign;
     }
 
-    public long recommendedGeometryCapacityBytes() {
-        final long minimum = 256L << 20;
-        final long maximum = (this.integratedGpu ? 1024L : 2048L) << 20;
-        long target;
-        if (this.deviceLocalHeapBytes > 0) {
-            target = this.deviceLocalHeapBytes / (this.integratedGpu ? 8 : 4);
-        } else {
-            target = this.integratedGpu ? (512L << 20) : (1024L << 20);
+    public record DeviceLocalBudget(long usageBytes, long budgetBytes, long availableBytes) {}
+
+    /** Snapshot of Minecraft's VMA accounting for the largest device-local heap. */
+    public DeviceLocalBudget deviceLocalBudget() {
+        try (MemoryStack stack = stackPush()) {
+            var budgets = VmaBudget.calloc(VK_MAX_MEMORY_HEAPS, stack);
+            Vma.vmaGetHeapBudgets(this.vmaAllocator, budgets);
+            var heap = budgets.get(this.deviceLocalHeapIndex);
+            long budget = heap.budget();
+            long usage = heap.usage();
+            if (budget <= 0) budget = this.deviceLocalHeapBytes;
+            if (usage < 0) usage = 0;
+            return new DeviceLocalBudget(usage, budget, Math.max(0L, budget - usage));
         }
-        target = Math.max(minimum, Math.min(maximum, target));
-        return target & ~7L;
     }
 
-    private VkPhysicalDeviceMemoryProperties memoryProperties;
-    public int findMemoryType(int typeBits, int required) {
-        if (this.memoryProperties == null) {
-            this.memoryProperties = VkPhysicalDeviceMemoryProperties.malloc();
-            vkGetPhysicalDeviceMemoryProperties(this.physicalDevice, this.memoryProperties);
+    /**
+     * Geometry allocation policy based on live VMA budget, not just total VRAM.
+     * The query happens after Voxy's atlas and staging buffers exist, so it also
+     * accounts for Minecraft/other current allocations visible to the shared VMA.
+     */
+    public long recommendedGeometryCapacityBytes() {
+        final long floor = 64L * MIB;
+        final long policyMaximum = (this.integratedGpu ? 1024L : 2048L) * MIB;
+
+        long policyTarget;
+        if (this.deviceLocalHeapBytes > 0) {
+            policyTarget = this.deviceLocalHeapBytes / (this.integratedGpu ? 8 : 4);
+        } else {
+            policyTarget = this.integratedGpu ? (512L * MIB) : (1024L * MIB);
         }
-        var mem = this.memoryProperties;
-        for (int i = 0; i < mem.memoryTypeCount(); i++) {
-            if ((typeBits & (1 << i)) != 0 && (mem.memoryTypes(i).propertyFlags() & required) == required) return i;
+        policyTarget = Math.min(policyMaximum, Math.max(floor, policyTarget));
+
+        DeviceLocalBudget live = this.deviceLocalBudget();
+        if (live.budgetBytes() > 0) {
+            //Keep explicit headroom for Minecraft's later frame targets, Sodium,
+            //other mods, and allocation spikes. Then let geometry consume at most
+            //half of what remains instead of racing the heap to 100% utilization.
+            long reserve = this.integratedGpu
+                    ? Math.max(256L * MIB, live.budgetBytes() / 8)
+                    : Math.max(512L * MIB, live.budgetBytes() / 10);
+            long afterReserve = Math.max(0L, live.availableBytes() - reserve);
+            long budgetTarget = afterReserve / 2;
+            policyTarget = Math.min(policyTarget, Math.max(floor, budgetTarget));
         }
-        throw new IllegalStateException("No suitable VK memory type");
+
+        return policyTarget & ~7L;
     }
 
     public void destroy() {
@@ -203,10 +242,6 @@ public final class VulkanContext {
         if (this.subgroupProps != null) {
             this.subgroupProps.free();
             this.subgroupProps = null;
-        }
-        if (this.memoryProperties != null) {
-            this.memoryProperties.free();
-            this.memoryProperties = null;
         }
     }
 }
