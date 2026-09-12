@@ -16,10 +16,6 @@ import static me.cortex.voxy.common.util.AllocationArena.SIZE_LIMIT;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
-//Pure-VK GPU->CPU readback: vkCmdCopyBuffer into a host-visible readback
-// buffer at commit(); callbacks fire from tick() once the producing frame's
-// event has signaled (the copy provably completed). Mirrors the GL
-// DownloadStream fence/frame model.
 public class VkDownloadStream extends AbstractDownloadStream {
     private final VkFrameCtx ctx;
     private final VkBuffer readbackBuffer;
@@ -33,19 +29,23 @@ public class VkDownloadStream extends AbstractDownloadStream {
 
     private long caddr = -1;
     private long offset = 0;
-    //The frame whose command buffer actually recorded the pending copies. tick()
-    // runs at the START of the next render frame (after endFrame advanced the
-    // counter), so currentFrame() there is one AHEAD of the frame the copy was
-    // recorded into — tagging with it made readbacks retire (and fire their
-    // node-visibility callbacks) a whole frame late. Capture the true recording
-    // frame at commit() instead.
     private long recordFrame = -1;
 
     public VkDownloadStream(VkFrameCtx ctx, long size) {
         this.ctx = ctx;
-        this.readbackBuffer = new VkBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
-        this.readbackPtr = this.readbackBuffer.map();
-        this.allocationArena.setLimit(size);
+        VkBuffer readback = null;
+        long mapped = 0;
+        try {
+            readback = new VkBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+            mapped = readback.map();
+            this.allocationArena.setLimit(size);
+        } catch (RuntimeException | Error failure) {
+            if (readback != null) readback.free();
+            ctx.waitIdleRetireAll();
+            throw failure;
+        }
+        this.readbackBuffer = readback;
+        this.readbackPtr = mapped;
         ctx.addRetireListener(this::retireUpTo);
     }
 
@@ -84,12 +84,8 @@ public class VkDownloadStream extends AbstractDownloadStream {
     @Override
     public void commit() {
         if (this.downloadList.isEmpty()) return;
-        //Capture the frame currently being recorded — the copies below land in its
-        // command buffer and complete when its event signals.
         this.recordFrame = this.ctx.currentFrame();
         var cmd = this.ctx.cmd();
-        //Source buffers are compute/raster/transfer outputs; narrow from ALL_COMMANDS
-        // to the actual producing stages so unrelated GPU work overlaps the copy.
         this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -112,15 +108,11 @@ public class VkDownloadStream extends AbstractDownloadStream {
     public void tick() {
         this.commit();
         if (!this.thisFrameAllocations.isEmpty()) {
-            //Tag with the frame the copies were RECORDED in (captured at commit),
-            // not currentFrame() — which at this early-in-frame tick() is one ahead.
             this.frames.add(new DownloadFrame(this.recordFrame,
                     new LongArrayList(this.thisFrameAllocations), new ArrayList<>(this.thisFrameDownloadList)));
             this.thisFrameAllocations.clear();
             this.thisFrameDownloadList.clear();
         }
-        //pollRetired() is called once at the end of each frame by VkRenderCore;
-        // polling here too was redundant (3x/frame).
     }
 
     private void retireUpTo(long retiredFrame) {
@@ -146,10 +138,7 @@ public class VkDownloadStream extends AbstractDownloadStream {
     public void flushWaitClear() {
         this.tick();
         this.ctx.waitIdleRetireAll();
-        if (!this.frames.isEmpty()) {
-            //waitIdleRetireAll retires via listener; anything left means listener ordering broke
-            throw new IllegalStateException();
-        }
+        if (!this.frames.isEmpty()) throw new IllegalStateException();
     }
 
     @Override
