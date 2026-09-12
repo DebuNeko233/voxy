@@ -1,6 +1,12 @@
 name: check-does-build-pr
 
-on: [ pull_request ]
+on:
+  pull_request:
+  push:
+    branches:
+      - vulkan
+  workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
