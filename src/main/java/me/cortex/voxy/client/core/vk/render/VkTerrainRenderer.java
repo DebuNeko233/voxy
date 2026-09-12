@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.core.vk.render;
 
+import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.core.vk.VkBuffer;
@@ -10,6 +11,7 @@ import me.cortex.voxy.client.core.vk.VkImage2D;
 import me.cortex.voxy.client.core.vk.VkShaderPipeline;
 import me.cortex.voxy.client.core.vk.VkShaderSource;
 import me.cortex.voxy.client.core.vk.VkUploadStream;
+import me.cortex.voxy.client.core.vk.compat.VitrailCompat;
 import me.cortex.voxy.common.Logger;
 import org.joml.Matrix4f;
 import org.lwjgl.system.MemoryStack;
@@ -64,6 +66,9 @@ public class VkTerrainRenderer {
     private VkShaderPipeline terrainOpaque;
     private VkShaderPipeline terrainTranslucent;
     private int pipelineColorFormat = -1, pipelineDepthFormat = -1;
+    private int pipelinePhotonGbufferFormat = -1, pipelinePhotonLodFormat = -1;
+    private boolean pipelinePhoton;
+    private boolean warnedPhotonTargets;
 
     public VkTerrainRenderer(VkFrameCtx ctx, VkUploadStream uploadStream, VkDownloadStream downloadStream,
                              RenderProperties properties, VkSectionGeometryData geometry, VkModelStore modelStore) {
@@ -173,10 +178,50 @@ public class VkTerrainRenderer {
         this.cullRaster = cullPipeline;
     }
 
-    private void ensureTerrainPipelines(VkViewport viewport) {
+    /**
+     * Resolve Vitrail's current views once for this Voxy frame. The returned views
+     * must never be retained past the frame because Vitrail recreates them on a
+     * resize.
+     */
+    public VitrailCompat.PhotonTargets resolvePhotonTargets(VkViewport viewport) {
+        var targets = VitrailCompat.photonTargets();
+        if (targets == null) return null;
+
+        var gbuffer = targets.gbuffer();
+        var lod = targets.lodBridge();
+        int gbufferFormat = VkFrameHost.vkFormat(gbuffer);
+        int lodFormat = VkFrameHost.vkFormat(lod);
+        boolean sizeMatches = gbuffer.texture().getWidth(0) == viewport.width
+                && gbuffer.texture().getHeight(0) == viewport.height
+                && lod.texture().getWidth(0) == viewport.width
+                && lod.texture().getHeight(0) == viewport.height;
+        boolean formatMatches = gbufferFormat == VK_FORMAT_R16G16B16A16_UNORM
+                && lodFormat == VK_FORMAT_R32G32_SFLOAT;
+        if (!sizeMatches || !formatMatches) {
+            if (!this.warnedPhotonTargets) {
+                this.warnedPhotonTargets = true;
+                Logger.warn("Voxy VK: Vitrail Photon bridge targets do not match the required full-resolution "
+                        + "RGBA16_UNORM/RG32_SFLOAT layout; falling back to the normal Voxy compositor");
+            }
+            return null;
+        }
+        return targets;
+    }
+
+    private void ensureTerrainPipelines(VkViewport viewport, VitrailCompat.PhotonTargets photonTargets) {
         int cf = viewport.colour.format;
         int df = viewport.depthStencil.format;
-        if (this.terrainOpaque != null && cf == this.pipelineColorFormat && df == this.pipelineDepthFormat) return;
+        boolean photon = photonTargets != null;
+        int pgf = photon ? VkFrameHost.vkFormat(photonTargets.gbuffer()) : VK_FORMAT_UNDEFINED;
+        int plf = photon ? VkFrameHost.vkFormat(photonTargets.lodBridge()) : VK_FORMAT_UNDEFINED;
+        if (this.terrainOpaque != null
+                && cf == this.pipelineColorFormat
+                && df == this.pipelineDepthFormat
+                && photon == this.pipelinePhoton
+                && pgf == this.pipelinePhotonGbufferFormat
+                && plf == this.pipelinePhotonLodFormat) {
+            return;
+        }
 
         var cardinalLight = net.minecraft.client.Minecraft.getInstance().level.cardinalLighting();
         String vert = VkShaderSource.load("voxy:lod/gl46/quads3.vert", VkShaderSource.defs().props(this.properties)
@@ -194,13 +239,19 @@ public class VkTerrainRenderer {
         VkShaderPipeline newOpaque = null;
         VkShaderPipeline newTranslucent = null;
         try {
-            var opaque = new VkShaderPipeline.GfxDesc();
-            opaque.name = "terrain-opaque";
-            opaque.vertGlsl = vert;
-            opaque.fragGlsl = VkShaderSource.load("voxy:lod/gl46/quads.frag", VkShaderSource.defs().props(this.properties)
+            var opaqueDefs = VkShaderSource.defs().props(this.properties)
                     .defIf("VOXY_VULKAN_SAMPLE_MASK_DISCARD", this.ctx.vk().needsSampleMaskDiscard)
-                    .build());
-            opaque.colorFormat = cf;
+                    .defIf("VOXY_VULKAN_PHOTON", photon);
+
+            var opaque = new VkShaderPipeline.GfxDesc();
+            opaque.name = photon ? "terrain-opaque-photon" : "terrain-opaque";
+            opaque.vertGlsl = vert;
+            opaque.fragGlsl = VkShaderSource.load("voxy:lod/gl46/quads.frag", opaqueDefs.build());
+            if (photon) {
+                opaque.colorFormats = new int[]{cf, pgf, plf};
+            } else {
+                opaque.colorFormat = cf;
+            }
             opaque.depthFormat = df;
             opaque.stencilFormat = df;
             opaque.depthTest = true;
@@ -239,11 +290,18 @@ public class VkTerrainRenderer {
         this.terrainTranslucent = newTranslucent;
         this.pipelineColorFormat = cf;
         this.pipelineDepthFormat = df;
+        this.pipelinePhoton = photon;
+        this.pipelinePhotonGbufferFormat = pgf;
+        this.pipelinePhotonLodFormat = plf;
         if (oldOpaque != null) oldOpaque.free();
         if (oldTranslucent != null) oldTranslucent.free();
     }
 
     private final Matrix4f uniformScratch = new Matrix4f();
+
+    private static float nativeRenderDistanceChunks() {
+        return Math.round(VoxyConfig.CONFIG.sectionRenderDistance * 32.0f);
+    }
 
     public void uploadUniform(VkViewport viewport) {
         long ptr = this.uploadStream.upload(this.uniform, 0, 1024);
@@ -256,7 +314,8 @@ public class VkTerrainRenderer {
             viewport.frameId &= 0x7fffffff;
         }
         MemoryUtil.memPutInt(ptr, viewport.frameId & 0x7fffffff); ptr += 4;
-        viewport.innerTranslation.getToAddress(ptr);
+        viewport.innerTranslation.getToAddress(ptr); ptr += 4 * 3;
+        MemoryUtil.memPutFloat(ptr, nativeRenderDistanceChunks());
         this.uploadStream.commit();
     }
 
@@ -287,7 +346,7 @@ public class VkTerrainRenderer {
                         | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
-        this.beginRendering(cmd, viewport, 0L);
+        this.beginRendering(cmd, viewport, 0L, null, false);
         try {
             this.cullRaster.bind(cmd);
             VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
@@ -351,36 +410,46 @@ public class VkTerrainRenderer {
         return (int) Math.min(required, (long) capacity);
     }
 
-    public void renderOpaque(VkViewport viewport, boolean clearTargets) {
-        this.ensureTerrainPipelines(viewport);
+    public void renderOpaque(VkViewport viewport, boolean clearTargets,
+                             VitrailCompat.PhotonTargets photonTargets) {
+        this.ensureTerrainPipelines(viewport, photonTargets);
         int sectionCount = this.geometry.getSectionCount();
-        if (sectionCount == 0) return;
+        if (sectionCount == 0) {
+            if (photonTargets != null) this.clearPhotonLodBridge(viewport, photonTargets);
+            return;
+        }
         this.uploadUniform(viewport);
         int maxDraw = fixedCountUpperBound(sectionCount,
                 MAX_OPAQUE_COMMANDS_PER_SECTION, VkViewport.OPAQUE_DRAW_COUNT);
-        this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, 0, 4 * 3, maxDraw);
+        this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, 0, 4 * 3, maxDraw,
+                photonTargets, true);
     }
 
-    public void renderTemporal(VkViewport viewport) {
-        this.ensureTerrainPipelines(viewport);
+    public void renderTemporal(VkViewport viewport, VitrailCompat.PhotonTargets photonTargets) {
+        this.ensureTerrainPipelines(viewport, photonTargets);
         int sectionCount = this.geometry.getSectionCount();
         if (sectionCount == 0) return;
         int maxDraw = fixedCountUpperBound(sectionCount,
                 MAX_TEMPORAL_COMMANDS_PER_SECTION, VkViewport.TEMPORAL_DRAW_COUNT);
-        this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw);
+        this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque,
+                TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw, photonTargets, false);
     }
 
-    public void renderTranslucent(VkViewport viewport) {
-        this.ensureTerrainPipelines(viewport);
+    public void renderTranslucent(VkViewport viewport, VitrailCompat.PhotonTargets photonTargets) {
+        //Use the same pipeline mode selected for this frame so enabling Photon
+        //does not make the opaque pipeline thrash off/on before the next frame.
+        this.ensureTerrainPipelines(viewport, photonTargets);
         int sectionCount = this.geometry.getSectionCount();
         if (sectionCount == 0) return;
         int maxDraw = fixedCountUpperBound(sectionCount,
                 MAX_TRANSLUCENT_COMMANDS_PER_SECTION, VkViewport.TRANSLUCENT_DRAW_COUNT);
-        this.renderTerrain(viewport, viewport.colourSSAO.view, this.terrainTranslucent, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw);
+        this.renderTerrain(viewport, viewport.colourSSAO.view, this.terrainTranslucent,
+                TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, null, false);
     }
 
     private void renderTerrain(VkViewport viewport, long colorView, VkShaderPipeline pipeline,
-                               long indirectOffset, long drawCountOffset, int maxDrawCount) {
+                               long indirectOffset, long drawCountOffset, int maxDrawCount,
+                               VitrailCompat.PhotonTargets photonTargets, boolean clearPhotonLod) {
         var cmd = this.ctx.cmd();
         this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -394,7 +463,12 @@ public class VkTerrainRenderer {
         VkFrameHost.barrierMcImageForSampling(cmd, lightmap, false);
         long lightmapView = VkFrameHost.vkView(lightmap);
 
-        this.beginRendering(cmd, viewport, colorView);
+        if (photonTargets != null) {
+            VkFrameHost.barrierMcImageForAttachment(cmd, photonTargets.gbuffer(), false);
+            VkFrameHost.barrierMcImageForAttachment(cmd, photonTargets.lodBridge(), false);
+        }
+
+        this.beginRendering(cmd, viewport, colorView, photonTargets, clearPhotonLod);
         try {
             pipeline.bind(cmd);
             VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
@@ -421,9 +495,40 @@ public class VkTerrainRenderer {
         } finally {
             vkCmdEndRenderingKHR(cmd);
         }
+
+        if (photonTargets != null) {
+            VkFrameHost.barrierMcImageForExternalUse(cmd, photonTargets.gbuffer(), false);
+            VkFrameHost.barrierMcImageForExternalUse(cmd, photonTargets.lodBridge(), false);
+        }
     }
 
-    private void beginRendering(VkCommandBuffer cmd, VkViewport viewport, long colorView) {
+    private void clearPhotonLodBridge(VkViewport viewport, VitrailCompat.PhotonTargets photonTargets) {
+        var cmd = this.ctx.cmd();
+        VkFrameHost.barrierMcImageForAttachment(cmd, photonTargets.lodBridge(), false);
+        try (MemoryStack stack = stackPush()) {
+            var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack);
+            colorAttach.get(0).sType$Default()
+                    .imageView(VkFrameHost.vkView(photonTargets.lodBridge()))
+                    .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
+                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            colorAttach.get(0).clearValue().color()
+                    .float32(0, 1.0f)
+                    .float32(1, nativeRenderDistanceChunks())
+                    .float32(2, 0.0f)
+                    .float32(3, 0.0f);
+            var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
+                    .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
+                    .layerCount(1)
+                    .pColorAttachments(colorAttach);
+            vkCmdBeginRenderingKHR(cmd, info);
+            vkCmdEndRenderingKHR(cmd);
+        }
+        VkFrameHost.barrierMcImageForExternalUse(cmd, photonTargets.lodBridge(), false);
+    }
+
+    private void beginRendering(VkCommandBuffer cmd, VkViewport viewport, long colorView,
+                                VitrailCompat.PhotonTargets photonTargets, boolean clearPhotonLod) {
         try (MemoryStack stack = stackPush()) {
             var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(viewport.depthStencil.view)
@@ -441,11 +546,32 @@ public class VkTerrainRenderer {
                     .pDepthAttachment(depthAttach)
                     .pStencilAttachment(stencilAttach);
             if (colorView != 0L) {
-                var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+                int count = photonTargets == null ? 1 : 3;
+                var colorAttach = VkRenderingAttachmentInfoKHR.calloc(count, stack);
+                colorAttach.get(0).sType$Default()
                         .imageView(colorView)
                         .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
                         .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                         .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                if (photonTargets != null) {
+                    colorAttach.get(1).sType$Default()
+                            .imageView(VkFrameHost.vkView(photonTargets.gbuffer()))
+                            .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
+                            .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
+                            .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                    colorAttach.get(2).sType$Default()
+                            .imageView(VkFrameHost.vkView(photonTargets.lodBridge()))
+                            .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
+                            .loadOp(clearPhotonLod ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD)
+                            .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                    if (clearPhotonLod) {
+                        colorAttach.get(2).clearValue().color()
+                                .float32(0, 1.0f)
+                                .float32(1, nativeRenderDistanceChunks())
+                                .float32(2, 0.0f)
+                                .float32(3, 0.0f);
+                    }
+                }
                 info.pColorAttachments(colorAttach);
             }
             vkCmdBeginRenderingKHR(cmd, info);
