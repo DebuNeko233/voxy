@@ -182,22 +182,52 @@ public final class VkFrameCtx {
         this.runRetirement();
     }
 
+    private static Throwable collectFailure(Throwable first, Throwable next) {
+        if (first == null) return next;
+        first.addSuppressed(next);
+        return first;
+    }
+
+    private static void rethrowFailure(Throwable failure) {
+        if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+        if (failure instanceof Error errorFailure) throw errorFailure;
+    }
+
     private void runRetirement() {
-        for (var l : this.retireListeners) {
-            l.onFramesRetired(this.retiredCounter);
+        Throwable failure = null;
+
+        //A readback callback is application logic and may fail. Never let it
+        //prevent the other staging stream or native deferred-destroy queues from
+        //retiring resources whose GPU work has already completed.
+        for (var listener : this.retireListeners) {
+            try {
+                listener.onFramesRetired(this.retiredCounter);
+            } catch (RuntimeException | Error listenerFailure) {
+                failure = collectFailure(failure, listenerFailure);
+            }
         }
-        this.pendingDestroys.removeIf(d -> {
-            if (d.frameIdx <= this.retiredCounter) {
+
+        var destroyIterator = this.pendingDestroys.iterator();
+        while (destroyIterator.hasNext()) {
+            var d = destroyIterator.next();
+            if (d.frameIdx > this.retiredCounter) continue;
+            try {
                 if (d.buffer != VK_NULL_HANDLE) vkDestroyBuffer(this.ctx.device, d.buffer, null);
                 if (d.imageView != VK_NULL_HANDLE) vkDestroyImageView(this.ctx.device, d.imageView, null);
                 if (d.image != VK_NULL_HANDLE) vkDestroyImage(this.ctx.device, d.image, null);
                 if (d.memory != VK_NULL_HANDLE) vkFreeMemory(this.ctx.device, d.memory, null);
-                return true;
+            } catch (RuntimeException | Error destroyFailure) {
+                failure = collectFailure(failure, destroyFailure);
+            } finally {
+                destroyIterator.remove();
             }
-            return false;
-        });
-        this.pendingPipelineDestroys.removeIf(d -> {
-            if (d.frameIdx <= this.retiredCounter) {
+        }
+
+        var pipelineIterator = this.pendingPipelineDestroys.iterator();
+        while (pipelineIterator.hasNext()) {
+            var d = pipelineIterator.next();
+            if (d.frameIdx > this.retiredCounter) continue;
+            try {
                 if (d.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(this.ctx.device, d.pipeline, null);
                 if (d.pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(this.ctx.device, d.pipelineLayout, null);
                 if (d.modules != null) {
@@ -205,10 +235,14 @@ public final class VkFrameCtx {
                         if (module != VK_NULL_HANDLE) vkDestroyShaderModule(this.ctx.device, module, null);
                     }
                 }
-                return true;
+            } catch (RuntimeException | Error destroyFailure) {
+                failure = collectFailure(failure, destroyFailure);
+            } finally {
+                pipelineIterator.remove();
             }
-            return false;
-        });
+        }
+
+        rethrowFailure(failure);
     }
 
     private long obtainEvent() {
@@ -224,11 +258,6 @@ public final class VkFrameCtx {
     }
 
     private void markDeferredWorkForCurrentFrame() {
-        //A resource can be retired during a live MC frame before Voxy records any
-        //other command (for example, a transactional resize that fails halfway).
-        //Without a frame marker that destroy would be tagged with frameCounter
-        //but no event would ever advance retiredCounter to it, especially after
-        //the renderer fault latch disables further frames.
         if (this.frameCmd != null) {
             this.anyWorkThisFrame = true;
         }
