@@ -1,6 +1,6 @@
 # Building the Voxy mod JAR
 
-The repository includes one-click build entry points for all supported desktop platforms. All three use the checked-in Gradle wrapper, perform a clean build, and copy the newest installable remapped Fabric mod JAR into `dist/`.
+The repository includes one-click build entry points for Windows, Linux and macOS. All three use the checked-in Gradle wrapper, perform a clean build, and copy the newest installable remapped Fabric mod JAR into `dist/`.
 
 ## Requirements
 
@@ -8,7 +8,7 @@ The repository includes one-click build entry points for all supported desktop p
 - Internet access on the first build so Gradle can download dependencies
 - Git is recommended because Voxy embeds the current commit hash when available
 
-The build scripts pass `-PincludeOtherArchs=true`, so the produced package keeps the additional native variants used by the multi-platform build rather than stripping them for a single development machine.
+The one-click scripts build for the current platform. They intentionally do **not** force `-PincludeOtherArchs=true`; that option is reserved for dedicated universal/release packaging because it can make Loom resolve foreign Minecraft runtime natives that are not needed for a normal local build.
 
 ## Windows
 
