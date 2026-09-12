@@ -179,9 +179,8 @@ public class VkTerrainRenderer {
     }
 
     /**
-     * Resolve Vitrail's current views once for this Voxy frame. The returned views
-     * must never be retained past the frame because Vitrail recreates them on a
-     * resize.
+     * Resolve Vitrail's current views once for a draw. The returned views must
+     * never be retained across frames because Vitrail recreates them on resize.
      */
     public VitrailCompat.PhotonTargets resolvePhotonTargets(VkViewport viewport) {
         var targets = VitrailCompat.photonTargets();
@@ -408,6 +407,20 @@ public class VkTerrainRenderer {
         if (sectionCount <= 0) return 0;
         long required = (long) sectionCount * commandsPerSection;
         return (int) Math.min(required, (long) capacity);
+    }
+
+    //Keep the original public API used by VkRenderCore. Each phase asks Vitrail
+    //for a fresh view, satisfying its no-view-caching rule across resizes.
+    public void renderOpaque(VkViewport viewport, boolean clearTargets) {
+        this.renderOpaque(viewport, clearTargets, this.resolvePhotonTargets(viewport));
+    }
+
+    public void renderTemporal(VkViewport viewport) {
+        this.renderTemporal(viewport, this.resolvePhotonTargets(viewport));
+    }
+
+    public void renderTranslucent(VkViewport viewport) {
+        this.renderTranslucent(viewport, this.resolvePhotonTargets(viewport));
     }
 
     public void renderOpaque(VkViewport viewport, boolean clearTargets,
