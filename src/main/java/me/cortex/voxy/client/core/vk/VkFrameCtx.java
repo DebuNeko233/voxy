@@ -138,9 +138,6 @@ public final class VkFrameCtx {
             check(vkWaitForFences(this.ctx.device, fence, true, Long.MAX_VALUE), "vkWaitForFences(immediate)");
             completed = true;
         } finally {
-            //Never free a command buffer that may still be pending. A failed wait
-            // normally means device-lost; queue-idle is a best-effort final sync
-            // before releasing the command-buffer/fence handles.
             if (submitted && !completed) {
                 vkQueueWaitIdle(this.ctx.queue);
             }
@@ -156,7 +153,13 @@ public final class VkFrameCtx {
         while (!this.inFlight.isEmpty()) {
             var frame = this.inFlight.peek();
             int status = vkGetEventStatus(this.ctx.device, frame.event);
-            if (status != VK_EVENT_SET) break;
+            if (status == VK_EVENT_RESET) break;
+            if (status != VK_EVENT_SET) {
+                //Do not silently reinterpret device-lost or any future Vulkan
+                // error as "not ready". That would freeze retiredCounter forever
+                // and make every deferred buffer/image/pipeline accumulate.
+                check(status, "vkGetEventStatus(frame " + frame.frameIdx + ")");
+            }
             this.inFlight.pop();
             check(vkResetEvent(this.ctx.device, frame.event), "vkResetEvent");
             this.eventPool.add(frame.event);
@@ -168,7 +171,13 @@ public final class VkFrameCtx {
 
     public void waitIdleRetireAll() {
         this.flushImmediate();
-        vkDeviceWaitIdle(this.ctx.device);
+        int idle = vkDeviceWaitIdle(this.ctx.device);
+        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) {
+            check(idle, "vkDeviceWaitIdle");
+        }
+        if (idle == VK_ERROR_DEVICE_LOST) {
+            Logger.warn("Voxy VK: device lost while waiting for retirement; destroying Voxy-owned objects during teardown");
+        }
         while (!this.inFlight.isEmpty()) {
             vkDestroyEvent(this.ctx.device, this.inFlight.pop().event, null);
         }
