@@ -105,9 +105,6 @@ public class VkRenderCore {
             this.compositor = new VkCompositor(this.frameCtx, this.uploadStream, this.properties,
                     VoxyConfig.CONFIG.getFogMode().hasFog);
             this.ssao = new VkSSAO(this.frameCtx, this.uploadStream, this.properties, VoxyConfig.CONFIG.getSSAOMode());
-            //Depth-bound culling: Sodium's visibility mixins feed the store; the bound
-            // renderer rasters visible-chunk AABBs into the depth-bound image so the
-            // terrain shaders can discard LOD fragments vanilla terrain will cover.
             this.visibleSectionStream = new StreamedBoundStore(
                     size -> new VkBuffer(this.frameCtx, size));
             this.boundRenderer = new VkBoundRenderer(this.frameCtx, this.uploadStream, this.properties);
@@ -134,16 +131,6 @@ public class VkRenderCore {
         }
     }
 
-    //Renders one Voxy frame into MC's frame command buffer. Called from the
-    // render hook right after MC's opaque terrain pass, on the render thread.
-    //
-    //matrices are Sodium's per-frame ChunkRenderMatrices — the exact
-    // projection+modelView MC/Sodium just drew the terrain with, INCLUDING
-    // per-frame view bobbing/nausea/portal warps. They must be used instead of
-    // the raw cameraRenderState matrices: computeProjectionMat extracts the
-    // bob delta as rawMCProj^-1 x base, which collapses to identity if base IS
-    // rawMCProj, and viewRotationMatrix is rotation-only — both of which made
-    // the LODs bounce relative to vanilla terrain while walking.
     public void renderFrame(RenderTarget target, MinecraftVkHostAdapter adapter, ChunkRenderMatrices matrices,
                             double camX, double camY, double camZ) {
         var frameCmd = adapter.frameCommandBuffer();
@@ -157,9 +144,9 @@ public class VkRenderCore {
         this.frameCtx.flushImmediate();
         this.frameCtx.beginFrame(frameCmd);
         try {
-            if (me.cortex.voxy.commonImpl.VoxyCommon.IS_MINE_IN_ABYSS) {//same camera trickery as the GL setupViewport
+            if (me.cortex.voxy.commonImpl.VoxyCommon.IS_MINE_IN_ABYSS) {
                 int sector = (((int) Math.floor(camX) >> 4) + 512) >> 10;
-                camX -= sector << 14;//10+4
+                camX -= sector << 14;
                 camY += (16 + (256 - 32 - sector * 30)) * 16;
             }
 
@@ -171,7 +158,7 @@ public class VkRenderCore {
                     crs.fogData.renderDistanceStart, crs.fogData.renderDistanceEnd);
             viewport.setVanillaProjection(matrices.projection())
                     .setProjection(voxyProjection)
-                    .setModelView(matrices.modelView())//setModelView copies into the viewport's own matrix
+                    .setModelView(matrices.modelView())
                     .setCamera(camX, camY, camZ)
                     .setScreenSize(target.width, target.height)
                     .setFogParameters(fog)
@@ -183,17 +170,10 @@ public class VkRenderCore {
             var rt = new VkCompositor.VkViewportRT(viewport,
                     target.getColorTextureView(), target.getDepthTextureView(), target.width, target.height);
 
-            //1. copy MC depth in + stencil mask (also clears the offscreen targets)
             this.compositor.setupDepthStencil(rt);
-
-            //1.5 raster the vanilla-visible chunk bounds into the depth-bound image
-            // (sampled by the terrain draws below to cull LOD fragments behind vanilla)
             this.boundRenderer.render(viewport, this.visibleSectionStream);
-
-            //2. opaque LOD terrain (draw calls generated LAST frame)
             this.terrainRenderer.renderOpaque(viewport, false);
 
-            //3. HiZ + node management + hierarchical traversal
             this.compositor.offscreenToSampled(viewport);
             viewport.hiZ.buildMipChain(viewport.depthSampleView, viewport.width, viewport.height);
             this.compositor.offscreenToAttachment(viewport);
@@ -203,21 +183,14 @@ public class VkRenderCore {
             this.nodeCleaner.tick(this.traversal.getNodeBuffer());
             this.traversal.doTraversal(viewport);
 
-            //4. build the draw commands for this frame (prep, raster cull, cmdgen, translucency sort)
             this.terrainRenderer.buildDrawCalls(viewport);
-
-            //5. temporal, then SSAO (reads colour+depth, writes colourSSAO with
-            // sanitized alpha), then translucents onto the SSAO output — the same
-            // opaque->temporal->SSAO->translucent order as the GL pipeline
             this.terrainRenderer.renderTemporal(viewport);
             this.ssao.compute(viewport, rt);
             this.terrainRenderer.renderTranslucent(viewport);
 
-            //6. composite into MC's frame
             this.compositor.offscreenToSampled(viewport);
             this.compositor.composite(rt);
 
-            //7. dynamic CPU work (uploads recycled, model baking, render distance tracking)
             this.uploadStream.tick();
             this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ);
             this.modelService.tick(900_000);
@@ -235,6 +208,10 @@ public class VkRenderCore {
         debug.add("VK host mode: " + VulkanBackend.statusLine());
         debug.add("VkBuf [#/logical MiB/allocated MiB]: [" + VkBuffer.getCount() + "/"
                 + (VkBuffer.getTotalSize() >> 20) + "/" + (VkBuffer.getTotalAllocationSize() >> 20) + "]");
+        debug.add("VkFrame [current/retired/inFlight/pendingDestroy/eventPool]: ["
+                + this.frameCtx.currentFrame() + "/" + this.frameCtx.retiredFrame() + "/"
+                + this.frameCtx.inFlightFrameCount() + "/" + this.frameCtx.pendingDestroyCount() + "/"
+                + this.frameCtx.pooledEventCount() + "]");
         this.modelService.addDebugData(debug);
         this.renderGen.addDebugData(debug);
         this.nodeManager.addDebug(debug);
@@ -243,17 +220,11 @@ public class VkRenderCore {
 
     public void shutdown() {
         if (this.shutDown) {
-            //Idempotent: a second teardown would double-free / re-idle the device
             return;
         }
         this.shutDown = true;
         Logger.info("Shutting down Voxy pure-Vulkan render core");
 
-        //CPU-only stop first: detach world callbacks and join the node/gen worker
-        // threads (both produce CPU data only — GPU upload happens on the render
-        // thread), so nothing can enqueue more work while we tear down. The model
-        // bakery is NOT stopped here — its shutdown() frees GPU resources
-        // (VkModelStore), so it must run AFTER the device is idle.
         try {
             this.worldIn.setDirtyCallback(null);
             this.worldIn.getMapper().setBiomeCallback(null);
@@ -264,22 +235,10 @@ public class VkRenderCore {
             Logger.error("Error stopping VK render core CPU services", e);
         }
 
-        //Only touch the GPU if MC's adopted device is still alive. On full game
-        // exit MC's VulkanDevice.close() (which clears the host) can run before
-        // the level renderer closes; issuing vkDeviceWaitIdle / vkDestroy*
-        // against a destroyed device is a use-after-free in the driver. If the
-        // host is already gone the objects are unreachable anyway, so leaking
-        // them is strictly safer than a native crash.
         boolean deviceAlive = MinecraftVkHost.get() != null;
         if (deviceAlive) {
             try {
-                //Idle the device BEFORE destroying anything, so no destroy races
-                // GPU work still referencing these objects
                 this.frameCtx.waitIdleRetireAll();
-                //modelService.shutdown() joins the (CPU) baking thread and frees
-                // the VkModelStore exactly once. It OWNS the store's lifetime —
-                // VkRenderCore must not free modelStore itself (double
-                // vkDestroySampler, observed NVIDIA SIGSEGV on world unload).
                 this.modelService.shutdown();
                 this.boundRenderer.free();
                 this.visibleSectionStream.free();
