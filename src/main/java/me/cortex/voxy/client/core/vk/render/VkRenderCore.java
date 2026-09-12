@@ -90,7 +90,11 @@ public class VkRenderCore {
             this.modelService = new ModelBakerySubsystem(world.getMapper(), this.modelStore);
             this.renderGen = new RenderGenerationService(world, this.modelService, sm, false);
 
-            this.geometryData = new VkSectionGeometryData(this.frameCtx, 1 << 20, geometryCapacity());
+            long geometryCapacity = vctx.recommendedGeometryCapacityBytes();
+            Logger.info("Voxy VK geometry target: " + (geometryCapacity >> 20) + " MiB from "
+                    + (vctx.deviceLocalHeapBytes >> 20) + " MiB device-local heap"
+                    + (vctx.integratedGpu ? " (integrated GPU policy)" : " (discrete GPU policy)"));
+            this.geometryData = new VkSectionGeometryData(this.frameCtx, 1 << 20, geometryCapacity);
             this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData, this.renderGen,
                     new VkNodeGpuOps(this.frameCtx, this.uploadStream));
             this.nodeCleaner = new VkNodeCleaner(this.frameCtx, this.uploadStream, this.downloadStream, this.nodeManager);
@@ -128,11 +132,6 @@ public class VkRenderCore {
             world.releaseRef();
             throw e;
         }
-    }
-
-    private static long geometryCapacity() {
-        //Conservative fixed allocation (no sparse residency tricks on VK): 2GB, halved on failure inside VkSectionGeometryData
-        return 2048L << 20;
     }
 
     //Renders one Voxy frame into MC's frame command buffer. Called from the
@@ -234,8 +233,8 @@ public class VkRenderCore {
 
     public void addDebugInfo(List<String> debug) {
         debug.add("VK host mode: " + VulkanBackend.statusLine());
-        debug.add("VkBuf [#/Mb]: [" + VkBuffer.getCount() + "/"
-                + (VkBuffer.getTotalSize() / 1_000_000) + "]");
+        debug.add("VkBuf [#/logical MiB/allocated MiB]: [" + VkBuffer.getCount() + "/"
+                + (VkBuffer.getTotalSize() >> 20) + "/" + (VkBuffer.getTotalAllocationSize() >> 20) + "]");
         this.modelService.addDebugData(debug);
         this.renderGen.addDebugData(debug);
         this.nodeManager.addDebug(debug);
