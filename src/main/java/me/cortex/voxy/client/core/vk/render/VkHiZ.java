@@ -17,13 +17,6 @@ import static org.lwjgl.vulkan.VK10.*;
 // dispatch per level. Level 0 reduces from the offscreen depth image directly.
 // The whole pyramid lives in GENERAL layout (written as storage image, read as
 // sampled image by the traversal).
-//
-// When subgroup arithmetic is supported (MoltenVK/Metal, NVIDIA, AMD, Intel on
-// Vulkan 1.1+), levels 1..6 are collapsed into a SINGLE dispatch by the
-// subgroup reduce shader (hiz_subgroup.comp), cutting ~5 dispatches + 5
-// barriers per frame at 1080p. Level 0 still uses the per-level reduce (it
-// handles the non-power-of-two source/dest ratio). Any levels beyond 6 (for
-// pyramids larger than 64x64 base) fall back to the per-level loop.
 public class VkHiZ {
     private final VkFrameCtx ctx;
     private final VkShaderPipeline reduce;
@@ -37,35 +30,56 @@ public class VkHiZ {
 
     public VkHiZ(VkFrameCtx ctx, RenderProperties properties) {
         this.ctx = ctx;
-        this.reduce = new VkShaderPipeline(ctx, "hiz_reduce.comp",
-                VkShaderSource.load("voxy:hiz/vk/hiz_reduce.comp", VkShaderSource.defs().props(properties).build()),
-                16,
-                List.of(VkShaderPipeline.sampler(0), VkShaderPipeline.image(1)));
-    //Subgroup reduce: 7 bindings (mip_0 sampler + mip_1..mip_6 storage images).
-    //Only built when the device supports subgroup arithmetic AND the pyramid
-    // will have >= 7 levels.
-        if (ctx.vk().subgroupArithmetic) {
-            this.subgroupReduce = new VkShaderPipeline(ctx, "hiz_subgroup.comp",
-                    VkShaderSource.load("voxy:hiz/vk/hiz_subgroup.comp", VkShaderSource.defs().props(properties).build()),
+
+        VkShaderPipeline createdReduce = null;
+        VkShaderPipeline createdSubgroup = null;
+        long createdSampler = VK_NULL_HANDLE;
+        try {
+            createdReduce = new VkShaderPipeline(ctx, "hiz_reduce.comp",
+                    VkShaderSource.load("voxy:hiz/vk/hiz_reduce.comp", VkShaderSource.defs().props(properties).build()),
                     16,
-                    List.of(VkShaderPipeline.sampler(0),
-                            VkShaderPipeline.image(1), VkShaderPipeline.image(2), VkShaderPipeline.image(3),
-                            VkShaderPipeline.image(4), VkShaderPipeline.image(5), VkShaderPipeline.image(6)));
-        } else {
-            this.subgroupReduce = null;
+                    List.of(VkShaderPipeline.sampler(0), VkShaderPipeline.image(1)));
+
+            //Subgroup reduce is deliberately gated by VulkanContext. The gate is
+            //currently false until the subgroup shader is validated across subgroup widths.
+            if (ctx.vk().subgroupArithmetic) {
+                createdSubgroup = new VkShaderPipeline(ctx, "hiz_subgroup.comp",
+                        VkShaderSource.load("voxy:hiz/vk/hiz_subgroup.comp", VkShaderSource.defs().props(properties).build()),
+                        16,
+                        List.of(VkShaderPipeline.sampler(0),
+                                VkShaderPipeline.image(1), VkShaderPipeline.image(2), VkShaderPipeline.image(3),
+                                VkShaderPipeline.image(4), VkShaderPipeline.image(5), VkShaderPipeline.image(6)));
+            }
+            createdSampler = VkImage2D.createSampler(ctx.vk(), true, false);
+        } catch (RuntimeException | Error failure) {
+            //Sampler handles come from the per-device cache and are not owned by
+            //this object. Pipelines are owned here and must be rolled back if
+            //construction fails partway through.
+            if (createdSubgroup != null) createdSubgroup.free();
+            if (createdReduce != null) createdReduce.free();
+            throw failure;
         }
-        this.sampler = VkImage2D.createSampler(ctx.vk(), true, false);
+
+        this.reduce = createdReduce;
+        this.subgroupReduce = createdSubgroup;
+        this.sampler = createdSampler;
     }
 
     private void alloc(int width, int height) {
-        if (this.pyramid != null) this.pyramid.free();
-        this.levels = (int) Math.ceil(Math.log(Math.max(width, height)) / Math.log(2));
-        this.levels = Math.max(this.levels, 1);
-        this.pyramid = new VkImage2D(this.ctx, width, height, this.levels, VK_FORMAT_R32_SFLOAT,
+        int newLevels = (int) Math.ceil(Math.log(Math.max(width, height)) / Math.log(2));
+        newLevels = Math.max(newLevels, 1);
+
+        //Create first, swap second. If allocation fails the current pyramid
+        //remains valid and the viewport can recover on a later frame/resize.
+        VkImage2D newPyramid = new VkImage2D(this.ctx, width, height, newLevels, VK_FORMAT_R32_SFLOAT,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true);
+        VkImage2D oldPyramid = this.pyramid;
+        this.pyramid = newPyramid;
+        this.levels = newLevels;
         this.width = width;
         this.height = height;
         this.initialized = false;
+        if (oldPyramid != null) oldPyramid.free();
     }
 
     /**
@@ -103,15 +117,12 @@ public class VkHiZ {
             }
             vkCmdDispatch(cmd, (cw + 7) / 8, (ch + 7) / 8, 1);
         }
-        //Level 0 write -> level 1 read
         this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         sw = cw; sh = ch;
         cw = Math.max(cw / 2, 1);
         ch = Math.max(ch / 2, 1);
 
-        //Levels 1..6: single subgroup dispatch when available and pyramid has enough levels.
-        //The subgroup shader reduces 64x64 tiles of mip_0 to mip_1..mip_6 in one dispatch.
         int subgroupEndLevel = 0;
         if (this.subgroupReduce != null && this.levels >= 7) {
             this.subgroupReduce.bind(cmd);
@@ -131,20 +142,16 @@ public class VkHiZ {
                         .putInt(8, this.levels).putInt(12, 0);
                 this.subgroupReduce.pushConstants(cmd, pc);
             }
-            //One dispatch per 64x64 tile of the pyramid base.
             vkCmdDispatch(cmd, (this.width + 63) / 64, (this.height + 63) / 64, 1);
-            //mip_1..mip_6 writes -> subsequent level reads
             this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             subgroupEndLevel = 6;
-            //Advance cw/ch past the subgroup-covered levels for any remaining per-level loop.
             cw = Math.max(this.width >> 6, 1);
             ch = Math.max(this.height >> 6, 1);
             sw = Math.max(this.width >> 5, 1);
             sh = Math.max(this.height >> 5, 1);
         }
 
-        //Remaining levels (7+): per-level reduce loop.
         for (int i = subgroupEndLevel + 1; i < this.levels; i++) {
             this.reduce.bind(cmd);
             try (var binder = this.reduce.binder()) {
@@ -166,7 +173,6 @@ public class VkHiZ {
             ch = Math.max(ch / 2, 1);
         }
 
-        //Pyramid -> traversal sampling
         this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
