@@ -44,4 +44,12 @@ public interface IVkHost {
      * completion from an in-command-buffer VkEvent.
      */
     void deferUntilSubmissionComplete(Runnable action);
+
+    /**
+     * Advance Minecraft's own deferred-destruction queues until every slot that
+     * could contain Voxy resources has rotated. Implementations must do this via
+     * the host encoder/submission lifecycle; Voxy must never execute Mojang's
+     * destruction callbacks directly.
+     */
+    void drainDeferredDestruction();
 }
