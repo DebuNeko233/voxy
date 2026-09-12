@@ -281,18 +281,21 @@ public class VkTerrainRenderer {
                 VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
         this.beginRendering(cmd, viewport, 0L);
-        this.cullRaster.bind(cmd);
-        VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
-        try (var b = this.cullRaster.binder()) {
-            b.ubo(0, this.uniform)
-                    .ssbo(1, this.geometry.metadataBuffer())
-                    .ssbo(2, viewport.visibilityBuffer)
-                    .ssbo(3, viewport.indirectLookupBuffer)
-                    .push(cmd);
+        try {
+            this.cullRaster.bind(cmd);
+            VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
+            try (var b = this.cullRaster.binder()) {
+                b.ubo(0, this.uniform)
+                        .ssbo(1, this.geometry.metadataBuffer())
+                        .ssbo(2, viewport.visibilityBuffer)
+                        .ssbo(3, viewport.indirectLookupBuffer)
+                        .push(cmd);
+            }
+            vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexedIndirect(cmd, viewport.drawCountCallBuffer.buffer, 6 * 4, 1, 20);
+        } finally {
+            vkCmdEndRenderingKHR(cmd);
         }
-        vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
-        vkCmdDrawIndexedIndirect(cmd, viewport.drawCountCallBuffer.buffer, 6 * 4, 1, 20);
-        vkCmdEndRenderingKHR(cmd);
         this.ctx.barrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                 VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -389,30 +392,33 @@ public class VkTerrainRenderer {
                 VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
 
         this.beginRendering(cmd, viewport, colorView);
-        pipeline.bind(cmd);
-        VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
-        long lightmapView = VkFrameHost.lightmapView();
-        try (var b = pipeline.binder()) {
-            b.ubo(0, this.uniform)
-                    .ssbo(1, this.geometry.geometryBuffer())
-                    .ssbo(3, this.modelStore.modelBuffer)
-                    .ssbo(4, this.modelStore.modelColourBuffer)
-                    .ssbo(5, viewport.positionScratchBuffer)
-                    .sampler(8, this.modelStore.atlas.view, this.modelStore.atlasSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .sampler(9, lightmapView, this.lightmapSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .sampler(10, viewport.depthBoundSampleView, this.depthBoundSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .push(cmd);
+        try {
+            pipeline.bind(cmd);
+            VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
+            long lightmapView = VkFrameHost.lightmapView();
+            try (var b = pipeline.binder()) {
+                b.ubo(0, this.uniform)
+                        .ssbo(1, this.geometry.geometryBuffer())
+                        .ssbo(3, this.modelStore.modelBuffer)
+                        .ssbo(4, this.modelStore.modelColourBuffer)
+                        .ssbo(5, viewport.positionScratchBuffer)
+                        .sampler(8, this.modelStore.atlas.view, this.modelStore.atlasSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .sampler(9, lightmapView, this.lightmapSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .sampler(10, viewport.depthBoundSampleView, this.depthBoundSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .push(cmd);
+            }
+            vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
+            if (this.ctx.vk().hasDrawIndirectCount) {
+                vkCmdDrawIndexedIndirectCount(cmd,
+                        viewport.drawCallBuffer.buffer, indirectOffset,
+                        viewport.drawCountCallBuffer.buffer, drawCountOffset,
+                        maxDrawCount, 5 * 4);
+            } else {
+                vkCmdDrawIndexedIndirect(cmd, viewport.drawCallBuffer.buffer, indirectOffset, maxDrawCount, 5 * 4);
+            }
+        } finally {
+            vkCmdEndRenderingKHR(cmd);
         }
-        vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
-        if (this.ctx.vk().hasDrawIndirectCount) {
-            vkCmdDrawIndexedIndirectCount(cmd,
-                    viewport.drawCallBuffer.buffer, indirectOffset,
-                    viewport.drawCountCallBuffer.buffer, drawCountOffset,
-                    maxDrawCount, 5 * 4);
-        } else {
-            vkCmdDrawIndexedIndirect(cmd, viewport.drawCallBuffer.buffer, indirectOffset, maxDrawCount, 5 * 4);
-        }
-        vkCmdEndRenderingKHR(cmd);
     }
 
     private void beginRendering(VkCommandBuffer cmd, VkViewport viewport, long colorView) {
