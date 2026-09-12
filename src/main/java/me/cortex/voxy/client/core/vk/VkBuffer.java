@@ -144,19 +144,33 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
         return this;
     }
 
-    @Override
-    public void free() {
+    private void releaseJavaOwnership() {
         this.free0();
         if (this.mappedAddress != 0) {
-            //Unmapping CPU access does not return the allocation to VMA. Native
-            //buffer+allocation destruction is still deferred until Minecraft's
-            //submission retirement says the GPU is done with it.
             Vma.vmaUnmapMemory(this.ctx.vk().vmaAllocator, this.allocation);
             this.mappedAddress = 0;
         }
         COUNT--;
         TOTAL_SIZE -= this.size;
         TOTAL_ALLOCATION_SIZE -= this.allocationSize;
+    }
+
+    /**
+     * Immediate destruction is only legal after the caller has synchronously
+     * proven that every submitted command using this buffer completed. Normal
+     * frame resources must use free() and Minecraft's retirement queue.
+     */
+    public void freeCompletedNow() {
+        this.releaseJavaOwnership();
+        Vma.vmaDestroyBuffer(this.ctx.vk().vmaAllocator, this.buffer, this.allocation);
+    }
+
+    @Override
+    public void free() {
+        this.releaseJavaOwnership();
+        //Unmapping CPU access does not return the allocation to VMA. Native
+        //buffer+allocation destruction is still deferred until Minecraft's
+        //submission retirement says the GPU is done with it.
         this.ctx.deferDestroyVmaBuffer(this.buffer, this.allocation);
     }
 
