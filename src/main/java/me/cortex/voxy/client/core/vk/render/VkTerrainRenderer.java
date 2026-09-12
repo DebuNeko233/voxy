@@ -391,11 +391,17 @@ public class VkTerrainRenderer {
                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
                 VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
 
+        //Minecraft owns the lightmap image and keeps VulkanGpuTexture objects in
+        //GENERAL layout. Establish the sampling dependency before entering Voxy's
+        //dynamic rendering scope, but never transition the image behind Blaze3D.
+        var lightmap = VkFrameHost.lightmapTextureView();
+        VkFrameHost.barrierMcImageForSampling(cmd, lightmap, false);
+        long lightmapView = VkFrameHost.vkView(lightmap);
+
         this.beginRendering(cmd, viewport, colorView);
         try {
             pipeline.bind(cmd);
             VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
-            long lightmapView = VkFrameHost.lightmapView();
             try (var b = pipeline.binder()) {
                 b.ubo(0, this.uniform)
                         .ssbo(1, this.geometry.geometryBuffer())
@@ -403,7 +409,7 @@ public class VkTerrainRenderer {
                         .ssbo(4, this.modelStore.modelColourBuffer)
                         .ssbo(5, viewport.positionScratchBuffer)
                         .sampler(8, this.modelStore.atlas.view, this.modelStore.atlasSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                        .sampler(9, lightmapView, this.lightmapSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .sampler(9, lightmapView, this.lightmapSampler, VK_IMAGE_LAYOUT_GENERAL)
                         .sampler(10, viewport.depthBoundSampleView, this.depthBoundSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                         .push(cmd);
             }
