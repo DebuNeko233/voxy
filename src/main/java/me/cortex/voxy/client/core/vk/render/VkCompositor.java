@@ -152,8 +152,9 @@ public class VkCompositor {
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
 
-        VkFrameHost.transitionMcImage(cmd, rt.mcDepth, true,
-                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        //Minecraft-owned images remain in GENERAL for their entire Blaze3D
+        //lifetime. Only establish the dependency needed for shader sampling.
+        VkFrameHost.barrierMcImageForSampling(cmd, rt.mcDepth, true);
 
         boolean rendering = false;
         try {
@@ -191,7 +192,7 @@ public class VkCompositor {
             this.depthSetup.bind(cmd);
             VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
             try (var b = this.depthSetup.binder()) {
-                b.sampler(0, VkFrameHost.vkView(rt.mcDepth), this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                b.sampler(0, VkFrameHost.vkView(rt.mcDepth), this.depthSampler, VK_IMAGE_LAYOUT_GENERAL)
                         .push(cmd);
             }
             try (MemoryStack stack = stackPush()) {
@@ -205,8 +206,7 @@ public class VkCompositor {
             if (rendering) {
                 vkCmdEndRenderingKHR(cmd);
             }
-            VkFrameHost.transitionMcImage(cmd, rt.mcDepth, true,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            VkFrameHost.barrierMcImageForAttachment(cmd, rt.mcDepth, true);
         }
     }
 
@@ -271,17 +271,22 @@ public class VkCompositor {
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
+        //Blaze3D's main targets are GENERAL-layout images. Establish attachment
+        //dependencies but do not change the layout it expects.
+        VkFrameHost.barrierMcImageForAttachment(cmd, rt.mcColour, false);
+        VkFrameHost.barrierMcImageForAttachment(cmd, rt.mcDepth, true);
+
         boolean rendering = false;
         try {
             try (MemoryStack stack = stackPush()) {
                 var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
                         .imageView(VkFrameHost.vkView(rt.mcColour))
-                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                        .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                         .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                         .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
                 var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                         .imageView(VkFrameHost.vkView(rt.mcDepth))
-                        .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                         .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                         .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
                 var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
@@ -305,6 +310,10 @@ public class VkCompositor {
         } finally {
             if (rendering) {
                 vkCmdEndRenderingKHR(cmd);
+                //Make Voxy's colour/depth writes visible to the Minecraft passes
+                //that continue after the Sodium opaque-layer hook.
+                VkFrameHost.barrierMcImageForAttachment(cmd, rt.mcColour, false);
+                VkFrameHost.barrierMcImageForAttachment(cmd, rt.mcDepth, true);
             }
         }
     }
