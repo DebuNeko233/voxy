@@ -11,9 +11,12 @@ import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkQueue;
 
+import java.util.concurrent.TimeUnit;
+
 //IVkHost backed by Minecraft 26.2's live Blaze3D Vulkan device.
 public final class MinecraftVkHostAdapter implements IVkHost {
-    private static final long SYNCHRONOUS_SUBMIT_TIMEOUT_MS = 30_000L;
+    //Minecraft 26.2 GpuFence.awaitCompletion() takes a timeout in nanoseconds.
+    private static final long SYNCHRONOUS_SUBMIT_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(30);
     private final VulkanDevice device;
 
     public MinecraftVkHostAdapter(VulkanDevice device) {
@@ -54,7 +57,7 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         var fence = encoder.createFence();
         try {
             encoder.submit();
-            if (!fence.awaitCompletion(SYNCHRONOUS_SUBMIT_TIMEOUT_MS)) {
+            if (!fence.awaitCompletion(SYNCHRONOUS_SUBMIT_TIMEOUT_NS)) {
                 throw new IllegalStateException("Timed out waiting for Minecraft Vulkan submission used by Voxy");
             }
         } finally {
