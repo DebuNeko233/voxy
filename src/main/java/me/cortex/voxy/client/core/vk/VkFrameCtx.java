@@ -21,42 +21,30 @@ import static org.lwjgl.vulkan.VK10.*;
 //The per-frame Vulkan recording context for the pure-VK path.
 //
 //ALL of Voxy's GPU work is recorded into MC's live frame command buffer between
-// MC's own render passes (upload copies -> compute -> raster passes -> draws ->
-// readback copies), ordered with pipeline barriers. This class owns:
-//
-//  - the current recording target (cmd()), either MC's frame command buffer
-//    (inside the render hook) or a one-shot immediate buffer (resource
-//    construction outside a frame);
-//  - frame completion tracking WITHOUT touching MC's encoder internals: each
-//    Voxy frame ends with vkCmdSetEvent; the event provably signals only when
-//    MC has submitted the frame and the GPU reached Voxy's commands. Upload /
-//    download streams and deferred destruction retire on those events;
-//  - deferred destruction of buffers/images still referenced by frames in
-//    flight.
-//
-//Thread model: render thread only (MC records its VK frame on its render
-// thread, and every Voxy entry point here is called from that thread).
+// MC's own render passes. Frame events are also the lifetime boundary for every
+// native object that can still be referenced by an in-flight command buffer.
 public final class VkFrameCtx {
     public interface FrameRetireListener {
-        /** Called when GPU work for frame {@code frameIdx} has provably completed. */
         void onFramesRetired(long retiredUpToInclusive);
     }
 
     private final VulkanContext ctx;
-    private VkCommandBuffer frameCmd;      //MC's frame command buffer while inside the hook
-    private VkCommandBuffer immediateCmd;  //one-shot fallback outside the hook
+    private VkCommandBuffer frameCmd;
+    private VkCommandBuffer immediateCmd;
     private boolean anyWorkThisFrame;
 
-    private long frameCounter = 0;         //index of the frame currently being recorded
-    private long retiredCounter = -1;      //all frames <= this have completed on the GPU
+    private long frameCounter = 0;
+    private long retiredCounter = -1;
 
     private final Deque<InFlightFrame> inFlight = new ArrayDeque<>();
     private final ArrayList<Long> eventPool = new ArrayList<>();
     private final ArrayList<PendingDestroy> pendingDestroys = new ArrayList<>();
+    private final ArrayList<PendingPipelineDestroy> pendingPipelineDestroys = new ArrayList<>();
     private final ArrayList<FrameRetireListener> retireListeners = new ArrayList<>();
 
     private record InFlightFrame(long frameIdx, long event) {}
     private record PendingDestroy(long frameIdx, long buffer, long image, long imageView, long memory) {}
+    private record PendingPipelineDestroy(long frameIdx, long pipeline, long pipelineLayout, long[] modules) {}
 
     public VkFrameCtx(VulkanContext ctx) {
         this.ctx = ctx;
@@ -70,27 +58,22 @@ public final class VkFrameCtx {
         this.retireListeners.add(listener);
     }
 
-    /** Frame index currently being recorded; work recorded now completes when this frame retires. */
     public long currentFrame() {
         return this.frameCounter;
     }
 
-    /** Highest frame index whose Voxy GPU work is known to have completed. */
     public long retiredFrame() {
         return this.retiredCounter;
     }
 
-    /** Number of Voxy frame markers submitted but not yet observed complete. */
     public int inFlightFrameCount() {
         return this.inFlight.size();
     }
 
-    /** Number of native objects waiting for their tagged frame to retire. */
     public int pendingDestroyCount() {
-        return this.pendingDestroys.size();
+        return this.pendingDestroys.size() + this.pendingPipelineDestroys.size();
     }
 
-    /** Recycled event handles retained for later frame markers. */
     public int pooledEventCount() {
         return this.eventPool.size();
     }
@@ -98,13 +81,11 @@ public final class VkFrameCtx {
     //==================================================================================
     // Recording targets
 
-    /** Enter the render hook: record into MC's frame command buffer. */
     public void beginFrame(VkCommandBuffer mcFrameCommandBuffer) {
         if (this.frameCmd != null) throw new IllegalStateException("Frame already begun");
         this.frameCmd = mcFrameCommandBuffer;
     }
 
-    /** Leave the render hook: stamp the frame event and advance the frame counter. */
     public void endFrame() {
         if (this.frameCmd == null) throw new IllegalStateException("No frame begun");
         if (this.anyWorkThisFrame) {
@@ -117,9 +98,6 @@ public final class VkFrameCtx {
         this.frameCmd = null;
     }
 
-    //The command buffer to record into. Inside the render hook this is MC's
-    // frame command buffer; outside it, a one-shot immediate command buffer is
-    // begun on demand and submitted synchronously by flushImmediate().
     public VkCommandBuffer cmd() {
         this.anyWorkThisFrame = true;
         if (this.frameCmd != null) return this.frameCmd;
@@ -140,7 +118,6 @@ public final class VkFrameCtx {
         return this.immediateCmd;
     }
 
-    /** Submits + waits any pending immediate commands (resource init outside a frame). */
     public void flushImmediate() {
         if (this.immediateCmd == null) return;
         var cmd = this.immediateCmd;
@@ -163,7 +140,6 @@ public final class VkFrameCtx {
     //==================================================================================
     // Frame retirement
 
-    /** Poll frame events; retire completed frames (recycles staging space, runs destroys). */
     public void pollRetired() {
         boolean any = false;
         while (!this.inFlight.isEmpty()) {
@@ -181,15 +157,12 @@ public final class VkFrameCtx {
         }
     }
 
-    /** Hard sync: device idle, then retire EVERYTHING (shutdown / teardown). */
     public void waitIdleRetireAll() {
         this.flushImmediate();
         vkDeviceWaitIdle(this.ctx.device);
         while (!this.inFlight.isEmpty()) {
             vkDestroyEvent(this.ctx.device, this.inFlight.pop().event, null);
         }
-        //Device is idle: every recorded frame — including the one currently being
-        // recorded — has completed, so even current-frame-tagged destroys are safe.
         this.retiredCounter = this.frameCounter;
         this.runRetirement();
     }
@@ -204,6 +177,19 @@ public final class VkFrameCtx {
                 if (d.imageView != VK_NULL_HANDLE) vkDestroyImageView(this.ctx.device, d.imageView, null);
                 if (d.image != VK_NULL_HANDLE) vkDestroyImage(this.ctx.device, d.image, null);
                 if (d.memory != VK_NULL_HANDLE) vkFreeMemory(this.ctx.device, d.memory, null);
+                return true;
+            }
+            return false;
+        });
+        this.pendingPipelineDestroys.removeIf(d -> {
+            if (d.frameIdx <= this.retiredCounter) {
+                if (d.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(this.ctx.device, d.pipeline, null);
+                if (d.pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(this.ctx.device, d.pipelineLayout, null);
+                if (d.modules != null) {
+                    for (long module : d.modules) {
+                        if (module != VK_NULL_HANDLE) vkDestroyShaderModule(this.ctx.device, module, null);
+                    }
+                }
                 return true;
             }
             return false;
@@ -233,6 +219,16 @@ public final class VkFrameCtx {
         this.pendingDestroys.add(new PendingDestroy(this.frameCounter, VK_NULL_HANDLE, image, view, memory));
     }
 
+    /**
+     * Pipelines can be replaced while older Minecraft frame command buffers are
+     * still in flight. Destroy them only after the Voxy frame that last could
+     * reference them has retired.
+     */
+    public void deferDestroyPipeline(long pipeline, long pipelineLayout, long[] modules) {
+        this.pendingPipelineDestroys.add(new PendingPipelineDestroy(
+                this.frameCounter, pipeline, pipelineLayout, modules == null ? null : modules.clone()));
+    }
+
     //==================================================================================
     // Command helpers
 
@@ -242,7 +238,6 @@ public final class VkFrameCtx {
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     }
 
-    /** Global memory barrier in the current command buffer. */
     public void barrier(int srcStage, int srcAccess, int dstStage, int dstAccess) {
         try (MemoryStack stack = stackPush()) {
             var mb = VkMemoryBarrier.calloc(1, stack).sType$Default()
@@ -251,21 +246,18 @@ public final class VkFrameCtx {
         }
     }
 
-    /** Compute-write -> compute-read barrier (compute-to-compute chaining). */
     public void computeToComputeBarrier() {
         this.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
 
-    /** Compute-write -> draw-indirect/vertex-read barrier (cmdgen -> raster draw). */
     public void computeToDrawBarrier() {
         this.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
                 VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
     }
 
-    /** Compute-write -> transfer-read barrier (compute output -> download copy). */
     public void computeToTransferBarrier() {
         this.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -277,8 +269,9 @@ public final class VkFrameCtx {
             vkDestroyEvent(this.ctx.device, event, null);
         }
         this.eventPool.clear();
-        if (!this.pendingDestroys.isEmpty()) {
-            Logger.warn("VkFrameCtx freed with " + this.pendingDestroys.size() + " pending destroys remaining");
+        int pending = this.pendingDestroys.size() + this.pendingPipelineDestroys.size();
+        if (pending != 0) {
+            Logger.warn("VkFrameCtx freed with " + pending + " pending destroys remaining");
         }
     }
 }
