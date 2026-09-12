@@ -22,6 +22,7 @@ import java.util.function.Supplier;
  */
 public final class VitrailCompat {
     private static final Supplier<String> FLUSH_CAUSE = () -> "Voxy native Vulkan frame";
+    private static final StackWalker STACK_WALKER = StackWalker.getInstance();
 
     private static final boolean LOADED;
     private static final Method DRAWING_SHADOW;
@@ -55,6 +56,24 @@ public final class VitrailCompat {
     }
 
     private VitrailCompat() {
+    }
+
+    /**
+     * Vitrail deliberately uses LevelExtractor.allChanged() as a safe frame-boundary
+     * door when its own Sodium terrain mesh format, face shading, block-state IDs or
+     * shader-pack terrain requirements change. None of those rebuilds changes Voxy's
+     * native Vulkan geometry format or model atlas. Detect those direct Vitrail calls
+     * so Voxy can keep its multi-gigabyte VkRenderCore alive while Sodium rebuilds.
+     *
+     * Ordinary Minecraft/resource-pack/F3+A allChanged calls do not have a
+     * dev.vitrail.* frame and therefore still rebuild Voxy, which is required when
+     * the actual block model/texture atlas may have changed.
+     */
+    public static boolean isVitrailDrivenWorldRebuild() {
+        if (!LOADED) return false;
+        return STACK_WALKER.walk(frames -> frames
+                .map(StackWalker.StackFrame::getClassName)
+                .anyMatch(name -> name.startsWith("dev.vitrail.")));
     }
 
     /**
