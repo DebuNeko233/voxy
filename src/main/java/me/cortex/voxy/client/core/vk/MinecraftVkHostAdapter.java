@@ -2,19 +2,14 @@ package me.cortex.voxy.client.core.vk;
 
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import me.cortex.voxy.client.mixin.vk.AccessorVulkanCommandEncoder;
+import me.cortex.voxy.client.mixin.vk.AccessorVulkanDevice;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkQueue;
 
-//IVkHost backed by MC 26.2's live Blaze3D Vulkan device. The device-level
-// handles (instance/physical device/device/queue+family) are pulled directly
-// from MC's VulkanDevice and are stable for the device lifetime. The per-frame
-// command buffer is resolved live from MC's persistent command encoder; the
-// world colour/depth attachments are passed straight to the render core each
-// frame from the Sodium hook's output target, so the adapter holds no per-frame
-// state.
+//IVkHost backed by Minecraft 26.2's live Blaze3D Vulkan device.
 public final class MinecraftVkHostAdapter implements IVkHost {
     private final VulkanDevice device;
 
@@ -30,9 +25,10 @@ public final class MinecraftVkHostAdapter implements IVkHost {
 
     @Override
     public VkCommandBuffer frameCommandBuffer() {
-        //MC's persistent per-frame encoder; the command buffer it is currently
-        // recording into (null outside a render pass)
-        var encoder = (AccessorVulkanCommandEncoder) (Object) this.device.createCommandEncoder();
-        return encoder.voxy$currentCommandBuffer();
+        //Minecraft 26.2 stores one persistent final commandEncoder on the device.
+        //Access that exact object instead of depending on createCommandEncoder()
+        // returning the same encoder implementation forever.
+        var encoder = ((AccessorVulkanDevice) (Object) this.device).voxy$commandEncoder();
+        return ((AccessorVulkanCommandEncoder) (Object) encoder).voxy$currentCommandBuffer();
     }
 }
