@@ -4,6 +4,7 @@ import com.mojang.blaze3d.textures.GpuSampler;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
+import me.cortex.voxy.client.core.vk.compat.VitrailCompat;
 import me.cortex.voxy.client.core.vk.render.VkRenderCore;
 import me.cortex.voxy.common.Logger;
 import net.caffeinemc.mods.sodium.client.render.SodiumWorldRenderer;
@@ -32,6 +33,12 @@ public class MixinSodiumOpaqueVkFrame {
                                     double x, double y, double z, GpuSampler sampler, CallbackInfo ci) {
         if (group != ChunkSectionLayerGroup.OPAQUE) return;
         if (!(MinecraftVkHost.get() instanceof MinecraftVkHostAdapter adapter)) return;
+
+        //Vitrail re-enters Sodium's opaque path while rendering its shadow map and
+        //may also keep a dynamic-rendering pass open across world geometry. Native
+        //Voxy must skip the former and ask Vitrail to close the latter before it
+        //records its own Vulkan rendering scopes.
+        if (!VitrailCompat.prepareForWorldFrame()) return;
 
         var renderer = IVoxyRenderSystemHolder.getNullable();
         if (renderer == null || renderer.vkCore == null) return;
