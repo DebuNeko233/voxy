@@ -76,7 +76,8 @@ public final class VkShaderPipeline {
         public String vertGlsl, fragGlsl;
         public int pushConstantBytes;
         public List<Binding> bindings = new ArrayList<>();
-        public int colorFormat;
+        public int colorFormat = VK_FORMAT_UNDEFINED;
+        public int[] colorFormats;
         public int depthFormat;
         public int stencilFormat;
         public boolean depthTest = true, depthWrite = true;
@@ -87,6 +88,11 @@ public final class VkShaderPipeline {
         public boolean stencilWriteAlways1 = false;
         public int stencilWriteRef = 1;
         public int topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+
+    private static int[] resolveColorFormats(GfxDesc d) {
+        if (d.colorFormats != null) return d.colorFormats;
+        return d.colorFormat == VK_FORMAT_UNDEFINED ? new int[0] : new int[]{d.colorFormat};
     }
 
     private static boolean isStripTopology(int topology) {
@@ -146,23 +152,31 @@ public final class VkShaderPipeline {
                 depthState.back(depthState.front());
             }
 
-            var blendAttach = VkPipelineColorBlendAttachmentState.calloc(1, stack)
-                    .colorWriteMask(d.colorWrite ? 0xF : 0).blendEnable(d.blend);
-            if (d.blend) {
-                blendAttach.srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
-                        .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
-                        .colorBlendOp(VK_BLEND_OP_ADD)
-                        .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
-                        .dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
-                        .alphaBlendOp(VK_BLEND_OP_ADD);
-            }
+            int[] colorFormats = resolveColorFormats(d);
             var blend = VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default();
-            if (d.colorFormat != VK_FORMAT_UNDEFINED) blend.pAttachments(blendAttach);
+            if (colorFormats.length > 0) {
+                var blendAttachments = VkPipelineColorBlendAttachmentState.calloc(colorFormats.length, stack);
+                for (int i = 0; i < colorFormats.length; i++) {
+                    var attachment = blendAttachments.get(i)
+                            .colorWriteMask(d.colorWrite ? 0xF : 0)
+                            .blendEnable(d.blend);
+                    if (d.blend) {
+                        attachment.srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
+                                .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                                .colorBlendOp(VK_BLEND_OP_ADD)
+                                .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
+                                .dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                                .alphaBlendOp(VK_BLEND_OP_ADD);
+                    }
+                }
+                blend.pAttachments(blendAttachments);
+            }
 
             var rendering = VkPipelineRenderingCreateInfoKHR.calloc(stack).sType$Default()
                     .depthAttachmentFormat(d.depthFormat).stencilAttachmentFormat(d.stencilFormat);
-            if (d.colorFormat != VK_FORMAT_UNDEFINED) {
-                rendering.colorAttachmentCount(1).pColorAttachmentFormats(stack.ints(d.colorFormat));
+            if (colorFormats.length > 0) {
+                rendering.colorAttachmentCount(colorFormats.length)
+                        .pColorAttachmentFormats(stack.ints(colorFormats));
             }
 
             var gpci = VkGraphicsPipelineCreateInfo.calloc(1, stack).sType$Default()
