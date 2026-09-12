@@ -5,6 +5,7 @@ import me.cortex.voxy.client.core.vk.VkFrameCtx;
 import me.cortex.voxy.client.core.vk.VkImage2D;
 import me.cortex.voxy.client.core.vk.VkShaderPipeline;
 import me.cortex.voxy.client.core.vk.VkShaderSource;
+import me.cortex.voxy.client.core.vk.VkUtil;
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
 
@@ -85,8 +86,8 @@ public class VkHiZ {
         try {
             newPyramid = new VkImage2D(this.ctx, width, height, newLevels, VK_FORMAT_R32_SFLOAT,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true);
-        } catch (RuntimeException failure) {
-            if (this.pyramid == null) throw failure;
+        } catch (VkUtil.VulkanCallException failure) {
+            if (!failure.isOutOfMemory() || this.pyramid == null) throw failure;
             this.failedWidth = width;
             this.failedHeight = height;
             this.resizeRetryFrames = RESIZE_RETRY_FRAMES;
@@ -94,10 +95,10 @@ public class VkHiZ {
                 var budget = this.ctx.vk().deviceLocalBudget();
                 Logger.warn("Voxy VK: keeping previous " + this.width + "x" + this.height
                         + " Hi-Z pyramid after " + width + "x" + height
-                        + " allocation failed; VMA free=" + (budget.availableBytes() >> 20)
+                        + " allocation ran out of Vulkan memory; VMA free=" + (budget.availableBytes() >> 20)
                         + " MiB (" + failure.getMessage() + ")");
             } catch (RuntimeException ignored) {
-                Logger.warn("Voxy VK: keeping previous Hi-Z pyramid after resize allocation failed: "
+                Logger.warn("Voxy VK: keeping previous Hi-Z pyramid after resize OOM: "
                         + failure.getMessage());
             }
             return false;
