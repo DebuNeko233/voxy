@@ -139,11 +139,10 @@ public class VkSSAO {
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
 
-        boolean mcDepthSampled = false;
         if (this.isBetterSSAO) {
-            VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
-                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            mcDepthSampled = true;
+            //Minecraft's main depth image remains GENERAL; only synchronize its
+            //previous attachment writes before the compute shader samples it.
+            VkFrameHost.barrierMcImageForSampling(cmd, rt.mcDepth(), true);
         }
 
         try {
@@ -153,15 +152,14 @@ public class VkSSAO {
                         .sampler(1, viewport.colour.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                         .sampler(2, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 if (this.isBetterSSAO) {
-                    b.sampler(3, VkFrameHost.vkView(rt.mcDepth()), this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    b.sampler(3, VkFrameHost.vkView(rt.mcDepth()), this.depthSampler, VK_IMAGE_LAYOUT_GENERAL);
                 }
                 b.ubo(4, this.params).push(cmd);
             }
             vkCmdDispatch(cmd, (viewport.width + 7) / 8, (viewport.height + 7) / 8, 1);
         } finally {
-            if (mcDepthSampled) {
-                VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
-                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            if (this.isBetterSSAO) {
+                VkFrameHost.barrierMcImageForAttachment(cmd, rt.mcDepth(), true);
             }
             viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
