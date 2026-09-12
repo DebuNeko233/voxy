@@ -4,11 +4,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkCommandBuffer;
-import org.lwjgl.vulkan.VkCommandBufferAllocateInfo;
-import org.lwjgl.vulkan.VkCommandBufferBeginInfo;
-import org.lwjgl.vulkan.VkFenceCreateInfo;
 import org.lwjgl.vulkan.VkMemoryBarrier;
-import org.lwjgl.vulkan.VkSubmitInfo;
 
 import java.util.ArrayList;
 
@@ -19,17 +15,11 @@ import static org.lwjgl.vulkan.VK10.*;
 /**
  * Per-frame Vulkan recording/lifetime context.
  *
- * Voxy records into Minecraft's live command buffer, but submission ownership
- * remains entirely with Blaze3D. Resource retirement therefore MUST be tied to
- * Minecraft's submission completion. Minecraft 26.2 already implements this
- * with a timeline semaphore and a two-slot DestructionQueue; IVkHost exposes
- * that exact boundary through deferUntilSubmissionComplete().
- *
- * The older implementation used vkCmdSetEvent/vkGetEventStatus. An event being
- * signaled only proves execution reached that point in the command buffer; it
- * does not prove the submitted command buffer has completed, so destroying a
- * referenced VkBuffer/VkImage/VkDeviceMemory at that point violates Vulkan
- * object-lifetime requirements. No VkEvent is used here anymore.
+ * Voxy records into Minecraft's live command buffer and submission ownership
+ * remains entirely with Blaze3D. Resource retirement is tied to Minecraft's
+ * timeline-semaphore-backed DestructionQueue; Voxy never infers completion from
+ * an in-command-buffer event and never submits independently to the graphics
+ * queue.
  */
 public final class VkFrameCtx {
     public interface FrameRetireListener {
@@ -38,7 +28,7 @@ public final class VkFrameCtx {
 
     private final VulkanContext ctx;
     private VkCommandBuffer frameCmd;
-    private VkCommandBuffer immediateCmd;
+    private boolean synchronousHostWork;
     private boolean anyWorkThisFrame;
     private boolean closed;
 
@@ -90,6 +80,7 @@ public final class VkFrameCtx {
         this.throwDeferredFailure();
         if (this.closed) throw new IllegalStateException("VkFrameCtx is closed");
         if (this.frameCmd != null) throw new IllegalStateException("Frame already begun");
+        if (this.synchronousHostWork) throw new IllegalStateException("Unflushed synchronous Vulkan work before frame begin");
         if (mcFrameCommandBuffer == null) throw new IllegalArgumentException("Minecraft frame command buffer is null");
         this.frameCmd = mcFrameCommandBuffer;
         this.anyWorkThisFrame = false;
@@ -141,11 +132,10 @@ public final class VkFrameCtx {
     }
 
     /**
-     * Current recording target. Inside beginFrame/endFrame this is Minecraft's
-     * command buffer. Outside a frame Voxy uses a private one-shot command buffer
-     * and waits its own fence synchronously in flushImmediate(). Both paths are
-     * render-thread-only: VkQueue and the adopted Minecraft encoder are externally
-     * synchronized Vulkan objects.
+     * Current recording target. During normal rendering this is the Minecraft
+     * frame command buffer supplied by beginFrame(). Outside a frame, Voxy asks
+     * Minecraft's encoder for its current primary command buffer and marks that
+     * batch for synchronous submission by flushImmediate().
      */
     public VkCommandBuffer cmd() {
         RenderSystem.assertOnRenderThread();
@@ -154,61 +144,26 @@ public final class VkFrameCtx {
             this.anyWorkThisFrame = true;
             return this.frameCmd;
         }
-        if (this.immediateCmd == null) {
-            VkCommandBuffer allocated = null;
-            try (MemoryStack stack = stackPush()) {
-                var cbai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
-                        .commandPool(this.ctx.commandPool)
-                        .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-                        .commandBufferCount(1);
-                var pCmd = stack.mallocPointer(1);
-                check(vkAllocateCommandBuffers(this.ctx.device, cbai, pCmd), "vkAllocateCommandBuffers(immediate)");
-                allocated = new VkCommandBuffer(pCmd.get(0), this.ctx.device);
-                var begin = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
-                        .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-                check(vkBeginCommandBuffer(allocated, begin), "vkBeginCommandBuffer(immediate)");
-                this.immediateCmd = allocated;
-            } catch (RuntimeException | Error failure) {
-                if (allocated != null) {
-                    vkFreeCommandBuffers(this.ctx.device, this.ctx.commandPool, allocated);
-                }
-                throw failure;
-            }
-        }
-        return this.immediateCmd;
+        this.synchronousHostWork = true;
+        return this.ctx.hostCommandBuffer();
     }
 
+    /**
+     * Historical name retained for callers. There is no Voxy-owned immediate
+     * command buffer anymore: this submits Minecraft's current encoder batch and
+     * waits for that exact timeline submit to complete.
+     */
     public void flushImmediate() {
         RenderSystem.assertOnRenderThread();
         this.throwDeferredFailure();
-        if (this.immediateCmd == null) return;
-        var cmd = this.immediateCmd;
-        this.immediateCmd = null;
-        long fence = VK_NULL_HANDLE;
-        boolean submitted = false;
-        boolean completed = false;
-        try (MemoryStack stack = stackPush()) {
-            check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(immediate)");
-            var fci = VkFenceCreateInfo.calloc(stack).sType$Default();
-            var pFence = stack.callocLong(1);
-            int createFence = vkCreateFence(this.ctx.device, fci, null, pFence);
-            fence = pFence.get(0);
-            check(createFence, "vkCreateFence(immediate)");
-            var submit = VkSubmitInfo.calloc(stack).sType$Default()
-                    .pCommandBuffers(stack.pointers(cmd));
-            check(vkQueueSubmit(this.ctx.queue, submit, fence), "vkQueueSubmit(immediate)");
-            submitted = true;
-            check(vkWaitForFences(this.ctx.device, fence, true, Long.MAX_VALUE), "vkWaitForFences(immediate)");
-            completed = true;
-        } finally {
-            if (submitted && !completed) {
-                vkQueueWaitIdle(this.ctx.queue);
-            }
-            if (fence != VK_NULL_HANDLE) {
-                vkDestroyFence(this.ctx.device, fence, null);
-            }
-            vkFreeCommandBuffers(this.ctx.device, this.ctx.commandPool, cmd);
-        }
+        if (!this.synchronousHostWork) return;
+        if (this.frameCmd != null) throw new IllegalStateException("Cannot synchronously submit while a Voxy frame is active");
+
+        //Clear first. If submission itself fails, the encoder/device state is no
+        //longer safe to blindly re-submit on a cleanup path.
+        this.synchronousHostWork = false;
+        this.ctx.submitAndWaitCurrent();
+        this.throwDeferredFailure();
     }
 
     /** Host callbacks execute during Minecraft submit; polling is now only an error checkpoint. */
@@ -218,10 +173,9 @@ public final class VkFrameCtx {
     }
 
     /**
-     * Synchronous queue-idle helper for construction/teardown only. It does not
-     * manually execute Minecraft's destruction queue and must never be used to
-     * make allocations from the currently recording (not yet submitted) frame
-     * reusable.
+     * Synchronous device-idle helper for construction/teardown only. Current
+     * recorded work is first submitted through Minecraft's encoder so CPU/GPU
+     * ordering remains identical to Blaze3D's own command stream.
      */
     public void waitIdleRetireAll() {
         RenderSystem.assertOnRenderThread();
@@ -347,7 +301,7 @@ public final class VkFrameCtx {
         try {
             this.flushImmediate();
         } catch (RuntimeException | Error failure) {
-            Logger.error("Error flushing Voxy immediate Vulkan work during frame-context close", failure);
+            Logger.error("Error flushing Voxy synchronous Vulkan work during frame-context close", failure);
         }
         this.closed = true;
         this.retireListeners.clear();
