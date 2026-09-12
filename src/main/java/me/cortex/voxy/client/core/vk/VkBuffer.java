@@ -76,12 +76,12 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
             //constructor must therefore be transactional: otherwise every retry
             //leaves the already-created VkBuffer (or VkDeviceMemory after a bind
             //failure) alive and turns a recoverable OOM into persistent VRAM
-            //pressure.
-            if (allocatedMemory != VK_NULL_HANDLE) {
-                vkFreeMemory(vctx.device, allocatedMemory, null);
-            }
+            //pressure. Destroy the bound resource before freeing its memory.
             if (createdBuffer != VK_NULL_HANDLE) {
                 vkDestroyBuffer(vctx.device, createdBuffer, null);
+            }
+            if (allocatedMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(vctx.device, allocatedMemory, null);
             }
             throw failure;
         }
