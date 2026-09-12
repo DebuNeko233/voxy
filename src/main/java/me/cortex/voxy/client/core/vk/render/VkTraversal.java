@@ -25,9 +25,9 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
 //Pure-VK port of HierarchicalOcclusionTraverser: the same iterative BFS over
-// the LOD node tree (flip-flop GPU queues, one indirect dispatch per LOD layer),
-// HiZ-tested, emitting the render list + node requests. CPU-side TLN bookkeeping
-// and request readback are identical to the GL implementation.
+//the LOD node tree (flip-flop GPU queues, one indirect dispatch per LOD layer),
+//HiZ-tested, emitting the render list + node requests. CPU-side TLN bookkeeping
+//and request readback are identical to the GL implementation.
 public class VkTraversal {
     public static final int MAX_REQUEST_QUEUE_SIZE = HierarchicalOcclusionTraverser.MAX_REQUEST_QUEUE_SIZE;
     public static final int MAX_QUEUE_SIZE = HierarchicalOcclusionTraverser.MAX_QUEUE_SIZE;
@@ -144,8 +144,8 @@ public class VkTraversal {
 
         this.topNode2idxMapping.defaultReturnValue(-1);
         //Register callbacks only after every GPU resource has been created. A
-        // failed constructor must never leave AsyncNodeManager calling into a
-        // partially constructed traversal object.
+        //failed constructor must never leave AsyncNodeManager calling into a
+        //partially constructed traversal object.
         this.nodeManager.setTLNAddRemoveCallbacks(this::addTLN, this::remTLN);
     }
 
@@ -219,8 +219,13 @@ public class VkTraversal {
             }
             this.uploadStream.commit();
         }
+        //queueMetaBuffer is consumed both as SSBO data by the traversal shader
+        //and as VkDispatchIndirectCommand by vkCmdDispatchIndirect. The latter
+        //requires the DRAW_INDIRECT stage; COMPUTE_SHADER alone is not a valid
+        //destination stage for VK_ACCESS_INDIRECT_COMMAND_READ_BIT.
         this.ctx.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
 
         this.traversal.bind(cmd);
         for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
