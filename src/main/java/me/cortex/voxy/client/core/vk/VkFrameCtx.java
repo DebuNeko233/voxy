@@ -75,6 +75,26 @@ public final class VkFrameCtx {
         return this.frameCounter;
     }
 
+    /** Highest frame index whose Voxy GPU work is known to have completed. */
+    public long retiredFrame() {
+        return this.retiredCounter;
+    }
+
+    /** Number of Voxy frame markers submitted but not yet observed complete. */
+    public int inFlightFrameCount() {
+        return this.inFlight.size();
+    }
+
+    /** Number of native objects waiting for their tagged frame to retire. */
+    public int pendingDestroyCount() {
+        return this.pendingDestroys.size();
+    }
+
+    /** Recycled event handles retained for later frame markers. */
+    public int pooledEventCount() {
+        return this.eventPool.size();
+    }
+
     //==================================================================================
     // Recording targets
 
