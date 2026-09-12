@@ -149,31 +149,20 @@ public class VkDownloadStream extends AbstractDownloadStream {
 
     @Override
     public void waitDiscard() {
-        if (this.closed) return;
-        //Only safe as a synchronous operational helper when Minecraft has no
-        //host-retired frames outstanding. Normal renderer teardown uses free(),
-        //which discards CPU bookkeeping without reusing the staging buffer.
-        this.ctx.waitIdleRetireAll();
-        if (!this.frames.isEmpty() || this.ctx.inFlightFrameCount() != 0) {
-            throw new IllegalStateException("Cannot synchronously discard Vulkan readbacks before Minecraft submission retirement");
-        }
-        this.downloadList.clear();
-        this.thisFrameDownloadList.clear();
-        this.thisFrameAllocations.clear();
-        this.caddr = -1;
-        this.offset = 0;
-        this.recordFrame = -1;
-        this.allocationArena.reset();
+        //AbstractDownloadStream reserves this for shutdown paths. On Vulkan we
+        //must not force Minecraft's still-unsubmitted command buffer to retire;
+        //closing drops only CPU callback bookkeeping and defers the VkBuffer via
+        //Blaze3D's submission-safe destruction queue.
+        this.free();
     }
 
     @Override
     public void flushWaitClear() {
-        if (this.closed) return;
-        this.tick();
-        this.ctx.waitIdleRetireAll();
-        if (!this.frames.isEmpty() || this.ctx.inFlightFrameCount() != 0) {
-            throw new IllegalStateException("Vulkan readbacks are still owned by Minecraft submissions");
-        }
+        //For the same reason, shutdown cannot legally force pending host-owned
+        //submissions to complete callbacks here. The renderer is going away, so
+        //discard the callbacks and keep the native readback buffer alive until
+        //Minecraft retires the submission.
+        this.free();
     }
 
     @Override
