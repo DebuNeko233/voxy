@@ -25,6 +25,7 @@ public final class VkAtlasTextureReader extends IAtlasTextureReader {
         long image = ((VulkanGpuTexture) atlas).vkImage();
         long size = (long) width * height * 4;
         var staging = new VkBuffer(this.frameCtx, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        boolean gpuCompleted = false;
         try {
             var cmd = this.frameCtx.cmd();
 
@@ -56,18 +57,27 @@ public final class VkAtlasTextureReader extends IAtlasTextureReader {
                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                     VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 
+            //This waits the exact Minecraft timeline submission containing the
+            //copy, so after it returns the one-shot staging allocation has no GPU
+            //users and can be returned to VMA immediately instead of lingering
+            //for two more destruction-queue rotations.
             this.frameCtx.flushImmediate();
+            gpuCompleted = true;
 
             var out = new int[width * height];
             long ptr = staging.map();
             MemoryUtil.memIntBuffer(ptr, out.length).get(out);
             return out;
         } finally {
-            staging.free();
-            //The copy was synchronously submitted through Minecraft's encoder.
-            //waitIdle here is only teardown hygiene for this one-shot allocation;
-            //native destruction itself still follows the host destruction queue.
-            this.frameCtx.waitIdleRetireAll();
+            if (gpuCompleted) {
+                staging.freeCompletedNow();
+            } else {
+                //If recording/submission failed, lifetime is uncertain. Fall back
+                //to the normal submission-safe retirement path rather than making
+                //an unsafe immediate VMA destroy.
+                staging.free();
+                this.frameCtx.waitIdleRetireAll();
+            }
         }
     }
 
