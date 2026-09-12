@@ -33,26 +33,6 @@ public final class VulkanContext {
     public final int queueFamily;
     public final boolean hasDrawIndirectCount;
     //MASTER SWITCH for every subgroup-dependent VK path. Keep FALSE.
-    //
-    //querySubgroupProperties() used to chain a properties struct into
-    // vkGetPhysicalDeviceFeatures2, which silently returned all-zeroes, so
-    // subgroupArithmetic was false on EVERY device and the subgroup paths were
-    // dead code that had never once executed. Correcting the query turned all
-    // three of them on at once:
-    //
-    //   VkHiZ            - hiz_subgroup.comp builds the HiZ pyramid
-    //   VkTraversal      - traversal workgroup size 32 -> 64
-    //   VkTerrainRenderer- subgroup prefix-sum variant for translucent sorting
-    //
-    //That regressed rendering on both desktop and macOS: terrain flickered with
-    // only far LODs surviving, consistent with a bad HiZ pyramid feeding the
-    // traversal's occlusion test. hiz_subgroup.comp is also independently
-    // suspect — its comments assume a 64-wide subgroup, and its subgroupBarrier()
-    // at the mip_5/mip_6 tail runs with only 4 of 256 lanes still active, which
-    // SPIR-V requires to be subgroup-uniform.
-    //
-    //Flip to true only after validating each of the three paths on its own
-    // against the non-subgroup path (ab_compare.py) at several subgroup widths.
     private static final boolean ENABLE_SUBGROUP_PATHS = false;
 
     public final boolean subgroupArithmetic;
@@ -60,16 +40,6 @@ public final class VulkanContext {
     public final String deviceName;
     public final boolean integratedGpu;
     public final long deviceLocalHeapBytes;
-    /**
-     * Older MoltenVK versions enable SPIRV-Cross' discarded-fragment store
-     * checks on every GPU.  On the non-Apple Mac GPU families those checks use
-     * helper-thread state that is not reliable: covered fragments can be
-     * classified as helpers, leaving depth behind without a colour store.
-     *
-     * The Vulkan terrain shader avoids OpKill on that hardware so MoltenVK
-     * never takes the affected conversion path.  Apple GPUs and every
-     * non-macOS Vulkan implementation keep the regular discard shader.
-     */
     public final boolean needsSampleMaskDiscard;
     public final long commandPool;
     private VkPhysicalDeviceSubgroupProperties subgroupProps;
@@ -109,9 +79,6 @@ public final class VulkanContext {
             for (int i = 0; i < memProps.memoryHeapCount(); i++) {
                 var heap = memProps.memoryHeaps(i);
                 if ((heap.flags() & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
-                    //Use the largest local heap rather than summing heaps. Some
-                    //drivers expose multiple heaps that are not independently
-                    //usable by a single allocation strategy.
                     localHeapBytes = Math.max(localHeapBytes, heap.size());
                 }
             }
@@ -149,15 +116,9 @@ public final class VulkanContext {
 
     private static VkPhysicalDeviceSubgroupProperties querySubgroupProperties(VkPhysicalDevice pd) {
         try (MemoryStack stack = stackPush()) {
-            //VkPhysicalDeviceSubgroupProperties is a PROPERTIES struct: it extends
-            // VkPhysicalDeviceProperties2, not VkPhysicalDeviceFeatures2. Chaining it
-            // into vkGetPhysicalDeviceFeatures2 is invalid usage (VUID-VkPhysicalDeviceFeatures2-pNext-pNext)
-            // and leaves the struct at its calloc'd zeroes, so supportedOperations
-            // read back 0 and subgroup support was reported absent on EVERY device.
             var sg = VkPhysicalDeviceSubgroupProperties.calloc(stack).sType$Default();
             var p2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(sg.address());
             VK11.vkGetPhysicalDeviceProperties2(pd, p2);
-            // Return a malloc'd copy so the caller can read it past the stack frame.
             var copy = VkPhysicalDeviceSubgroupProperties.malloc();
             copy.set(sg);
             return copy;
@@ -165,7 +126,6 @@ public final class VulkanContext {
     }
 
     private long storageAlign = -1;
-    /** minStorageBufferOffsetAlignment of the physical device. */
     public long storageBufferOffsetAlignment() {
         if (this.storageAlign == -1) {
             try (MemoryStack stack = stackPush()) {
@@ -178,7 +138,6 @@ public final class VulkanContext {
     }
 
     private long uniformAlign = -1;
-    /** minUniformBufferOffsetAlignment of the physical device. */
     public long uniformBufferOffsetAlignment() {
         if (this.uniformAlign == -1) {
             try (MemoryStack stack = stackPush()) {
@@ -190,12 +149,6 @@ public final class VulkanContext {
         return this.uniformAlign;
     }
 
-    /**
-     * Initial geometry-pool target derived from the physical device rather than
-     * unconditionally reserving 2 GiB. VkSectionGeometryData can still halve
-     * this on allocation failure, but most GPUs should now start at a sensible
-     * size and avoid creating immediate memory pressure.
-     */
     public long recommendedGeometryCapacityBytes() {
         final long minimum = 256L << 20;
         final long maximum = (this.integratedGpu ? 1024L : 2048L) << 20;
@@ -209,8 +162,6 @@ public final class VulkanContext {
         return target & ~7L;
     }
 
-    //Device memory properties are immutable for the device lifetime; cache them
-    // instead of re-querying the driver per allocation. Freed in destroy().
     private VkPhysicalDeviceMemoryProperties memoryProperties;
     public int findMemoryType(int typeBits, int required) {
         if (this.memoryProperties == null) {
@@ -226,7 +177,10 @@ public final class VulkanContext {
 
     public void destroy() {
         vkDeviceWaitIdle(this.device);
+        //Static native-object caches are owned by the adopted device, not by an
+        //individual world renderer. Tear them down before MC destroys VkDevice.
         VkImage2D.destroySamplers(this);
+        VkShaderPipeline.destroyCachedLayouts(this);
         vkDestroyCommandPool(this.device, this.commandPool, null);
         if (this.subgroupProps != null) {
             this.subgroupProps.free();
@@ -236,6 +190,5 @@ public final class VulkanContext {
             this.memoryProperties.free();
             this.memoryProperties = null;
         }
-        //Host mode: MC owns the device/instance — only Voxy-owned objects are destroyed here.
     }
 }
