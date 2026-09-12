@@ -229,7 +229,7 @@ public final class VkImage2D {
     public static void destroySamplers(VulkanContext ctx) {
         long deviceAddress = ctx.device.address();
         for (var entry : SAMPLER_CACHE.entrySet()) {
-            if (entry.getKey().deviceAddress == deviceAddress
+            if (entry.getKey().deviceAddress() == deviceAddress
                     && SAMPLER_CACHE.remove(entry.getKey(), entry.getValue())) {
                 vkDestroySampler(ctx.device, entry.getValue(), null);
             }
