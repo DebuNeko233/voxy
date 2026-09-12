@@ -10,6 +10,9 @@ import me.cortex.voxy.client.core.vk.VkUploadStream;
 import me.cortex.voxy.client.core.vk.VkUtil;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.MemoryBuffer;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.resources.Identifier;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VkBufferImageCopy;
@@ -82,8 +85,14 @@ public class VkModelStore implements IModelStore {
                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
             ctx.flushImmediate();
 
+            int minecraftMaxMip = ((TextureAtlas) Minecraft.getInstance().getTextureManager()
+                    .getTexture(Identifier.fromNamespaceAndPath("minecraft", "textures/atlas/blocks.png")))
+                    .maxMipLevel;
+            int samplerMaxLod = Math.clamp(minecraftMaxMip - selectedMipBias, 0, selectedLevels - 1);
             try (MemoryStack stack = stackPush()) {
                 //Mirror the GL sampler: nearest mag, nearest-within-mip + linear-between-mips min.
+                //When the low-memory atlas starts at original mip1, translate the
+                //Minecraft max LOD into the new mip coordinate system as well.
                 var sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
                         .magFilter(VK_FILTER_NEAREST)
                         .minFilter(VK_FILTER_NEAREST)
@@ -91,13 +100,14 @@ public class VkModelStore implements IModelStore {
                         .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
                         .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
                         .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-                        .minLod(0).maxLod(selectedLevels - 1);
+                        .minLod(0).maxLod(samplerMaxLod);
                 var pSampler = stack.mallocLong(1);
                 check(vkCreateSampler(ctx.vk().device, sci, null, pSampler), "vkCreateSampler(modelAtlas)");
                 sampler = pSampler.get(0);
             }
 
             Logger.info("Voxy VK model atlas: tile=" + selectedTileSize + "px, levels=" + selectedLevels
+                    + ", maxLod=" + samplerMaxLod
                     + ", allocation=" + (atlasImage.allocationSize() >> 20) + " MiB"
                     + (selectedMipBias == 0 ? " (full resolution)" : " (mip-tail fallback)"));
         } catch (RuntimeException | Error failure) {
@@ -200,6 +210,11 @@ public class VkModelStore implements IModelStore {
         long totalBytesLong = 0;
         for (int dstLevel = 0; dstLevel < this.atlasLevels; dstLevel++) {
             totalBytesLong += mipBytes(dstLevel + this.atlasMipBias);
+        }
+        if (sourceOffset > texture.size - totalBytesLong) {
+            throw new IllegalStateException("Model mip-tail upload exceeds baked texture buffer: bias="
+                    + this.atlasMipBias + ", sourceOffset=" + sourceOffset + ", bytes=" + totalBytesLong
+                    + ", textureBytes=" + texture.size);
         }
         if (totalBytesLong > Integer.MAX_VALUE) throw new IllegalStateException("Model atlas upload is too large");
         int totalBytes = (int) totalBytesLong;
