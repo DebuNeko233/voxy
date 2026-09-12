@@ -1,6 +1,12 @@
 name: check-does-build-pr
 
-on: [ pull_request ]
+on:
+  pull_request:
+  push:
+    branches:
+      - vulkan
+  workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,6 +25,25 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: true
+
+      - name: Verify one-click build scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n build-mod-linux.sh
+          bash -n build-mod-macos.command
+          test -f build-mod-windows.bat
+
+      - name: Verify Vulkan host ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="src/main/java/me/cortex/voxy/client/core/vk"
+          forbidden='vkQueueSubmit|vkQueueWaitIdle|vkCreateCommandPool|vkAllocateMemory|vkFreeMemory|vkBindBufferMemory|vkBindImageMemory|vkCreateDevice|vkDestroyDevice|vmaCreateAllocator|vmaDestroyAllocator'
+          if grep -R -nE "$forbidden" "$root"; then
+            echo "::error::Voxy Vulkan must keep device, queue submission, command-pool and allocator ownership in Minecraft/Blaze3D."
+            exit 1
+          fi
 
       - name: Gradle build
         run: ./gradlew build

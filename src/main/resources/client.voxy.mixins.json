@@ -37,7 +37,11 @@
     "sodium.MixinRenderRegionManager",
     "sodium.MixinRenderSectionManager",
     "sodium.MixinSodiumWorldRenderer",
-    "sodium.MixinVisibleChunkCollector"
+    "sodium.MixinVisibleChunkCollector",
+    "vk.AccessorVulkanCommandEncoder",
+    "vk.AccessorVulkanDevice",
+    "vk.MixinSodiumOpaqueVkFrame",
+    "vk.MixinVulkanDevice"
   ],
   "injectors": {
     "defaultRequire": 1

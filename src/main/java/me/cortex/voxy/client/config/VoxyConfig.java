@@ -6,6 +6,7 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParseException;
 import me.cortex.voxy.client.core.NormalRenderPipeline;
 import me.cortex.voxy.client.core.SSAO;
+import me.cortex.voxy.client.core.backend.VoxyGraphicsBackend;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.cpu.CpuLayout;
 import me.cortex.voxy.commonImpl.VoxyCommon;
@@ -35,6 +36,22 @@ public class VoxyConfig {
     public float subDivisionSize = 64;
     public String fogMode;
     public boolean dontUseSodiumBuilderThreads = false;
+    public String rendererBackend = "native";
+    public boolean showBlaze3dIrisWarning = true;
+
+    public VoxyGraphicsBackend.RendererMode getRendererBackendMode() {
+        if (this.rendererBackend == null) return VoxyGraphicsBackend.RendererMode.NATIVE;
+        try {
+            return VoxyGraphicsBackend.RendererMode.valueOf(this.rendererBackend.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException exception) {
+            return VoxyGraphicsBackend.RendererMode.NATIVE;
+        }
+    }
+
+    public void setRendererBackendMode(VoxyGraphicsBackend.RendererMode mode) {
+        this.rendererBackend = mode.name().toLowerCase(Locale.ROOT);
+    }
+
     public String ssaoMode;
 
     public SSAO.SSAOMode getSSAOMode() {
@@ -64,12 +81,20 @@ public class VoxyConfig {
 
 
     private static VoxyConfig loadOrCreate() {
-        if (VoxyCommon.isAvailable()) {
+        //The client config is initialized before Voxy registers its instance
+        //factory, so isAvailable() is still false at this point. Config I/O is
+        //valid for the Minecraft client regardless of renderer init order.
+        if (canAccessClientConfig()) {
             var path = getConfigPath();
             if (Files.exists(path)) {
                 try (FileReader reader = new FileReader(path.toFile())) {
                     var conf = GSON.fromJson(reader, VoxyConfig.class);
                     if (conf != null) {
+                        // Auto used to mean Native when available. Keep that effective default
+                        // while removing the redundant choice from existing configuration files.
+                        if (conf.rendererBackend == null || conf.rendererBackend.equalsIgnoreCase("auto")) {
+                            conf.rendererBackend = "native";
+                        }
                         conf.save();
                         return conf;
                     } else {
@@ -96,7 +121,7 @@ public class VoxyConfig {
     }
 
     public void save() {
-        if (!VoxyCommon.isAvailable()) {
+        if (!canAccessClientConfig()) {
             Logger.info("Not saving config since voxy is unavalible");
             return;
         }
@@ -114,7 +139,21 @@ public class VoxyConfig {
                 .resolve("voxy-config.json");
     }
 
+    private static boolean canAccessClientConfig() {
+        return VoxyCommon.IS_IN_MINECRAFT && !VoxyCommon.IS_DEDICATED_SERVER;
+    }
+
     public boolean isRenderingEnabled() {
-        return VoxyCommon.isAvailable() && this.enabled && this.enableRendering;
+        return VoxyCommon.isAvailable()
+                && VoxyGraphicsBackend.usesNativeRenderer()
+                && this.enabled
+                && this.enableRendering;
+    }
+
+    public boolean isBlaze3dRenderingEnabled() {
+        return VoxyCommon.isAvailable()
+                && VoxyGraphicsBackend.usesBlaze3dRenderer()
+                && this.enabled
+                && this.enableRendering;
     }
 }

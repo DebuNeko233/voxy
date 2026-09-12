@@ -332,7 +332,11 @@ tasks.register('makeExcludedRocksDB', Zip) {
     exclude {
         def file = it.name
         if (file.endsWith(".jnilib")) {
-            return true
+            //RocksDB selects its native library from os.arch at runtime. Keep both
+            //macOS variants: Apple Silicon needs osx-arm64 and Intel Macs (and
+            //x86_64 macOS installations) need osx-x86_64. Removing either makes
+            //world creation fail before the renderer is initialized.
+            return !(file.contains("osx-arm64") || file.contains("osx-x86_64"))
         }
         if (!file.endsWith(".so")) {
             return false
@@ -367,6 +371,18 @@ jar {
 }
 
 project.ext.lwjglVersion = "3.4.1"
+
+// --- Voxy Vulkan backend deps (optional at runtime; probed via capability detection) ---
+dependencies {
+    include(implementation("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}"))
+    include(implementation("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}"))
+    for (n in ["natives-windows", "natives-linux", "natives-macos", "natives-macos-arm64"]) {
+        include(runtimeOnly("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}:${n}"))
+    }
+    // MoltenVK translation layer path on macOS is provided by lwjgl-vulkan natives there:
+    include(runtimeOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}:natives-macos"))
+    include(runtimeOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}:natives-macos-arm64"))
+}
 project.ext.lwjglNatives = "natives-windows"
 
 repositories {
@@ -386,6 +402,12 @@ dependencies {
     include(runtimeOnly "org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-windows")
     include(runtimeOnly "org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux")
     include(runtimeOnly "org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux")
+    //macOS natives: required for the MoltenVK/Vulkan path so Voxy's section
+    // storage (zstd compression + lmdb index) can load on Apple Silicon.
+    include(runtimeOnly "org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-macos")
+    include(runtimeOnly "org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-macos")
+    include(runtimeOnly "org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-macos-arm64")
+    include(runtimeOnly "org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-macos-arm64")
     if (INCLUDE_OTHER_ARCHS) {
         runtimeOnly "org.lwjgl:lwjgl:$lwjglVersion:natives-linux-arm64"
         include(runtimeOnly "org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux-arm64")
@@ -409,6 +431,51 @@ dependencies {
     //implementation 'redis.clients:jedis:5.1.0'
 }
 
+// The alternative renderer must remain a public-Blaze3D-only implementation.
+// Keep this as part of `check` so a future convenience import cannot silently
+// make the fallback require Vulkan, OpenGL 4.6, or Minecraft's private backend
+// implementations.
+tasks.register('verifyBlaze3dBackendIsolation') {
+    group = 'verification'
+    description = 'Rejects direct native graphics API use in the Blaze3D renderer.'
+
+    def blaze3dSources = fileTree('src/main/java/me/cortex/voxy/client/core/backend/blaze3d') {
+        include '**/*.java'
+    }
+    inputs.files(blaze3dSources)
+
+    doLast {
+        def forbidden = [
+                'org.lwjgl.opengl',
+                'org.lwjgl.vulkan',
+                'com.mojang.blaze3d.opengl',
+                'com.mojang.blaze3d.vulkan',
+                'me.cortex.voxy.client.core.gl',
+                'me.cortex.voxy.client.core.vk'
+        ]
+        def violations = []
+        blaze3dSources.each { source ->
+            def text = source.getText('UTF-8')
+            forbidden.each { symbol ->
+                if (text.contains(symbol)) {
+                    violations.add("${source}: forbidden native dependency '${symbol}'")
+                }
+            }
+            text.eachLine { line, number ->
+                if (line =~ /\b(?:vk[A-Z]\w*|gl[A-Z]\w*|VK_[A-Z0-9_]+|GL_[A-Z0-9_]+)\b/) {
+                    violations.add("${source}:${number}: direct native graphics symbol: ${line.trim()}")
+                }
+            }
+        }
+        if (!violations.isEmpty()) {
+            throw new GradleException('Blaze3D backend isolation failed:\n' + violations.join('\n'))
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('verifyBlaze3dBackendIsolation')
+}
 
 jmh {
     zip64 = true

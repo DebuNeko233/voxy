@@ -1,13 +1,16 @@
 package me.cortex.voxy.client;
 
 import com.mojang.brigadier.arguments.BoolArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.backend.blaze3d.VoxyBlaze3DProbeRenderer;
 import me.cortex.voxy.common.DebugUtils;
+import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import me.cortex.voxy.commonImpl.importers.DHImporter;
@@ -29,6 +32,33 @@ import java.util.concurrent.CompletableFuture;
 
 
 public class VoxyCommands {
+
+    public static LiteralArgumentBuilder<FabricClientCommandSource> registerToggleTestCube() {
+        return ClientCommands.literal("toggleTestCube")
+                .executes(VoxyCommands::toggleTestCube);
+    }
+
+    public static LiteralArgumentBuilder<FabricClientCommandSource> registerSetMinimumVoxyLod() {
+        return ClientCommands.literal("setMinimumVoxyLOD")
+                .then(ClientCommands.argument("level", IntegerArgumentType.integer(0, 4))
+                        .executes(VoxyCommands::setMinimumVoxyLod));
+    }
+
+    public static LiteralArgumentBuilder<FabricClientCommandSource> registerToggleVoxyProfiler() {
+        return ClientCommands.literal("toggleVoxyProfiler")
+                .executes(VoxyCommands::toggleVoxyProfiler);
+    }
+
+    public static LiteralArgumentBuilder<FabricClientCommandSource> registerVoxyLodDebug() {
+        return ClientCommands.literal("voxyLodDebug")
+                .executes(VoxyCommands::voxyLodDebug);
+    }
+
+    public static LiteralArgumentBuilder<FabricClientCommandSource> registerSetVoxyVanillaTransition() {
+        return ClientCommands.literal("setVoxyVanillaTransition")
+                .then(ClientCommands.argument("chunks", IntegerArgumentType.integer(0, 4))
+                        .executes(VoxyCommands::setVoxyVanillaTransition));
+    }
 
     public static LiteralArgumentBuilder<FabricClientCommandSource> register() {
         var imports = ClientCommands.literal("import")
@@ -93,6 +123,43 @@ public class VoxyCommands {
         var r = Minecraft.getInstance().levelExtractor;
         if (r != null) r.allChanged();
         return 0;
+    }
+
+    private static int toggleTestCube(CommandContext<FabricClientCommandSource> ctx) {
+        boolean visible = VoxyBlaze3DProbeRenderer.toggleTestCube();
+        ctx.getSource().sendFeedback(Component.literal("Voxy test cube " + (visible ? "enabled" : "disabled") + "."));
+        return 1;
+    }
+
+    private static int setMinimumVoxyLod(CommandContext<FabricClientCommandSource> ctx) {
+        int requestedLevel = IntegerArgumentType.getInteger(ctx, "level");
+        int lodLevel = VoxyBlaze3DProbeRenderer.setMinimumLodLevel(requestedLevel);
+        ctx.getSource().sendFeedback(Component.literal("Voxy minimum terrain detail set to LoD " + lodLevel
+                + " (one voxel per " + (1 << lodLevel) + " blocks). Screen-space selection may refine"
+                + " visible terrain further toward LoD 0; a full hierarchy refresh has been scheduled."));
+        return 1;
+    }
+
+    private static int toggleVoxyProfiler(CommandContext<FabricClientCommandSource> ctx) {
+        boolean enabled = VoxyBlaze3DProbeRenderer.togglePerformanceProfiler();
+        ctx.getSource().sendFeedback(Component.literal("Voxy performance profiler " + (enabled ? "enabled" : "disabled") + "."));
+        return 1;
+    }
+
+    private static int voxyLodDebug(CommandContext<FabricClientCommandSource> ctx) {
+        String summary = VoxyBlaze3DProbeRenderer.getLodDebugSummary();
+        Logger.info("Blaze3D " + summary);
+        ctx.getSource().sendFeedback(Component.literal(summary));
+        return 1;
+    }
+
+    private static int setVoxyVanillaTransition(CommandContext<FabricClientCommandSource> ctx) {
+        int chunks = VoxyBlaze3DProbeRenderer.setVanillaTransitionChunks(
+                IntegerArgumentType.getInteger(ctx, "chunks"));
+        ctx.getSource().sendFeedback(Component.literal("Voxy transition uses " + chunks
+                + " chunk" + (chunks == 1 ? "" : "s")
+                + " at the outer edge of Sodium's render distance."));
+        return 1;
     }
 
     private static int verifyTLNs(CommandContext<FabricClientCommandSource> ctx, boolean attemptRepair) {

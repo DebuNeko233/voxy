@@ -4,6 +4,7 @@ import me.cortex.voxy.client.ICheekyClientChunkCache;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
+import me.cortex.voxy.client.core.backend.blaze3d.VoxyBlaze3DProbeRenderer;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.common.world.service.VoxelIngestService;
 import net.caffeinemc.mods.sodium.client.render.chunk.RenderSection;
@@ -38,21 +39,28 @@ public class MixinRenderSectionManager {
     @Inject(method = "<init>", at = @At("TAIL"))
     private void voxy$resetChunkTracker(ClientLevel level, int renderDistance, SortBehavior sortBehavior, CallbackInfo ci) {
         this.bottomSectionY = this.level.getMinY()>>4;
+        VoxyBlaze3DProbeRenderer.setSodiumRenderDistanceChunks(renderDistance);
     }
 
     @Inject(method = "renderOutOfGraph", at = @At("HEAD"))
     private void voxy$injectReset1(Viewport viewport, FogParameters fogParameters, CallbackInfo ci) {
         var vrs = IVoxyRenderSystemHolder.getNullable();
-        if (vrs != null && !IrisUtil.irisShadowActive() && vrs.visbleSectionStream != null) {
-            vrs.visbleSectionStream.reset();
+        if (vrs != null && !IrisUtil.irisShadowActive()) {
+            if (vrs.visbleSectionStream != null) vrs.visbleSectionStream.reset();
+        }
+        if (!IrisUtil.irisShadowActive() && VoxyConfig.CONFIG.isBlaze3dRenderingEnabled()) {
+            VoxyBlaze3DProbeRenderer.beginVisibleVanillaSectionCollection();
         }
     }
 
     @Inject(method = "readRenderListFromTree", at = @At(value = "INVOKE", target = "Lnet/caffeinemc/mods/sodium/client/render/chunk/lists/VisibleChunkCollector;<init>(Lnet/caffeinemc/mods/sodium/client/render/chunk/region/RenderRegionManager;I)V"))
     private void voxy$injectReset2(Viewport viewport, FogParameters fogParameters, CallbackInfo ci) {
         var vrs = IVoxyRenderSystemHolder.getNullable();
-        if (vrs != null && !IrisUtil.irisShadowActive() && vrs.visbleSectionStream != null) {
-            vrs.visbleSectionStream.reset();
+        if (vrs != null && !IrisUtil.irisShadowActive()) {
+            if (vrs.visbleSectionStream != null) vrs.visbleSectionStream.reset();
+        }
+        if (!IrisUtil.irisShadowActive() && VoxyConfig.CONFIG.isBlaze3dRenderingEnabled()) {
+            VoxyBlaze3DProbeRenderer.beginVisibleVanillaSectionCollection();
         }
     }
 

@@ -5,3 +5,6 @@
 /run/
 /out/
 /logs/
+/compatibility-builds/
+/work/
+/dist/

@@ -32,6 +32,9 @@ struct QuadData {
     vec3 basePoint;
     vec2 quadSizeAddin;
     vec2 uvCorner;
+    vec2 uvSizeAddin;
+    uint face;
+    uint fluidCornerHeights;
 };
 
 uint makeQuadFlags(uint faceData, uint modelId, ivec2 quadSize, const in BlockModel model, uint face) {
@@ -124,35 +127,75 @@ void setupQuad(out QuadData quad, const in Quad rawQuad, uvec2 sPos, bool genera
     uint modelId = extractStateId(rawQuad);
     BlockModel model = modelData[modelId];
     uint faceData = model.faceData[face];
-    ivec2 quadSize = extractSize(rawQuad);
+    bool isFluid = modelIsFluid(model);
+    ivec2 quadSize = isFluid ? ivec2(1) : extractSize(rawQuad);
 
     if (generateAttributes) {
         quad.attributeData.x = makeQuadFlags(faceData, modelId, quadSize, model, face);
         quad.attributeData.yzw = makeRemainingAttributes(model, rawQuad, lodLevel, face);
     }
 
-    vec4 faceSize = getFaceSize(faceData);
+    vec4 textureFaceSize = getFaceSize(faceData);
+    vec4 geometryFaceSize = textureFaceSize;
+
+    //The texture remains cropped to the pixels baked by FluidRenderer. Fluid
+    //geometry itself uses exact cell boundaries; its top vertices are adjusted
+    //to the four neighbour-derived heights in getQuadCornerPos.
+    if (isFluid) {
+        geometryFaceSize = vec4(0.0, 1.0, 0.0, 1.0);
+    }
+
     #ifdef USE_SINGLE_TRI
-    faceSize *= 2;
+    textureFaceSize *= 2;
+    geometryFaceSize *= 2;
     #endif
     vec3 quadStart = extractPos(rawQuad);
-    float depthOffset = extractFaceIndentation(faceData);
-    quadStart += swizzelDataAxis(face>>1, vec3(faceSize.xz, mix(depthOffset, 1-depthOffset, float(face&1u))));
+    float depthOffset = isFluid ? 0.0 : extractFaceIndentation(faceData);
+    quadStart += swizzelDataAxis(face>>1, vec3(geometryFaceSize.xz, mix(depthOffset, 1-depthOffset, float(face&1u))));
 
     quad.lodScale = lodScale;
     quad.axis = face>>1;
     quad.basePoint = (quadStart*lodScale)+vec3(baseSection<<5);
     #ifdef USE_SINGLE_TRI
-    quad.quadSizeAddin = (faceSize.yw + (quadSize - 1)*2);
+    quad.quadSizeAddin = (geometryFaceSize.yw + (quadSize - 1)*2);
+    quad.uvSizeAddin = (textureFaceSize.yw + (quadSize - 1)*2);
     #else
-    quad.quadSizeAddin = faceSize.yw + quadSize - 1;
+    quad.quadSizeAddin = geometryFaceSize.yw + quadSize - 1;
+    quad.uvSizeAddin = textureFaceSize.yw + quadSize - 1;
     #endif
-    quad.uvCorner = faceSize.xz;
+    quad.uvCorner = textureFaceSize.xz;
+    quad.face = face;
+    quad.fluidCornerHeights = isFluid ? extractFluidCornerHeights(rawQuad) : uint(-1);
 }
 
 vec4 getQuadCornerPos(in QuadData quad, uint cornerId) {
-    vec2 cornerMask = vec2((cornerId>>1)&1u, cornerId&1u)*quad.lodScale;
+    uvec2 cornerBits = uvec2((cornerId>>1)&1u, cornerId&1u);
+    vec2 cornerMask = vec2(cornerBits)*quad.lodScale;
     vec3 point = quad.basePoint + swizzelDataAxis(quad.axis,vec3(quad.quadSizeAddin*cornerMask,0));
+
+    if (quad.fluidCornerHeights != uint(-1)) {
+        uint heightIndex = 0u;
+        bool applyHeight = false;
+        if (quad.face == 1u) {
+            //Top face: its two in-plane axes are world X and Z.
+            heightIndex = (cornerBits.x<<1)|cornerBits.y;
+            applyHeight = true;
+        } else if (quad.axis == 1u && cornerBits.y == 1u) {
+            //North/south face: X varies horizontally and Z is the face side.
+            heightIndex = (cornerBits.x<<1)|(quad.face&1u);
+            applyHeight = true;
+        } else if (quad.axis == 2u && cornerBits.x == 1u) {
+            //West/east face: X is the face side and Z varies horizontally.
+            heightIndex = ((quad.face&1u)<<1)|cornerBits.y;
+            applyHeight = true;
+        }
+
+        if (applyHeight) {
+            float height = float(((quad.fluidCornerHeights>>(heightIndex*3u))&7u)+1u)/8.0;
+            point.y += (height-1.0)*quad.lodScale;
+        }
+    }
+
     vec4 pos = MVP * vec4(point, 1.0f);
     pos.xy += taaOffset*pos.w;
     return pos;
@@ -160,7 +203,7 @@ vec4 getQuadCornerPos(in QuadData quad, uint cornerId) {
 
 #ifndef USE_NV_BARRY
 vec2 getCornerUV(const in QuadData quad, uint cornerId) {
-    return quad.uvCorner + quad.quadSizeAddin*vec2((cornerId>>1)&1u, cornerId&1u);
+    return quad.uvCorner + quad.uvSizeAddin*vec2((cornerId>>1)&1u, cornerId&1u);
 }
 #endif
 
