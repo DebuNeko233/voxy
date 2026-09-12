@@ -26,5 +26,16 @@ jobs:
         with:
           cache-read-only: true
 
+      - name: Verify Vulkan host ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="src/main/java/me/cortex/voxy/client/core/vk"
+          forbidden='vkQueueSubmit|vkQueueWaitIdle|vkCreateCommandPool|vkAllocateMemory|vkFreeMemory|vkBindBufferMemory|vkBindImageMemory|vkCreateDevice|vkDestroyDevice|vmaCreateAllocator|vmaDestroyAllocator'
+          if grep -R -nE "$forbidden" "$root"; then
+            echo "::error::Voxy Vulkan must keep device, queue submission, command-pool and allocator ownership in Minecraft/Blaze3D."
+            exit 1
+          fi
+
       - name: Gradle build
         run: ./gradlew build
