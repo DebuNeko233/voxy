@@ -3,7 +3,6 @@ package me.cortex.voxy.client.core.vk;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import me.cortex.voxy.client.core.rendering.util.AbstractUploadStream;
 import me.cortex.voxy.client.core.rendering.util.IDeviceBuffer;
-import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.AllocationArena;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkBufferCopy;
@@ -68,10 +67,11 @@ public class VkUploadStream extends AbstractUploadStream {
 
     @Override
     public long upload(IDeviceBuffer buffer, long destOffset, long size) {
+        if (!(buffer instanceof VkBuffer vkBuffer)) throw new IllegalArgumentException("Vulkan upload requires a VkBuffer destination");
         if (size <= 0 || size > Integer.MAX_VALUE) throw new IllegalArgumentException("Invalid Vulkan upload size: " + size);
         if (destOffset < 0 || destOffset > buffer.sizeBytes() - size) throw new IllegalArgumentException("Vulkan upload exceeds destination buffer");
         long addr = this.rawUploadAddress((int) size);
-        this.uploadList.add(new UploadData((VkBuffer) buffer, addr, destOffset, size));
+        this.uploadList.add(new UploadData(vkBuffer, addr, destOffset, size));
         return this.stagingPtr + addr;
     }
 
@@ -79,21 +79,19 @@ public class VkUploadStream extends AbstractUploadStream {
     public long rawUploadAddress(int size) {
         if (size < 0) throw new IllegalStateException("Negative size");
         size = this.alignUpAlloc(size);
-        if (size > this.stagingBuffer.size()) throw new IllegalArgumentException();
+        if (size > this.stagingBuffer.size()) throw new IllegalArgumentException("Upload larger than Vulkan staging buffer");
 
         long addr;
         if (this.caddr == -1 || !this.allocationArena.expand(this.caddr, size)) {
             this.caddr = this.allocationArena.alloc(size);
             if (this.caddr == SIZE_LIMIT) {
-                Logger.error("VK upload stream full, force-idling the device to recover; this will hitch");
-                int attempts = 10;
-                while (--attempts != 0 && this.caddr == SIZE_LIMIT) {
-                    this.ctx.waitIdleRetireAll();
-                    this.caddr = this.allocationArena.alloc(size);
-                }
-                if (this.caddr == SIZE_LIMIT) {
-                    throw new IllegalStateException("Could not allocate upload staging space even after device idle");
-                }
+                //The current Minecraft frame has not been submitted yet, so
+                //vkDeviceWaitIdle cannot make allocations consumed by this frame
+                //safe to reuse. Older versions attempted exactly that, which could
+                //overwrite staging bytes still referenced by an unsubmitted copy.
+                throw new IllegalStateException("Vulkan upload staging exhausted ("
+                        + (this.stagingBuffer.size() >> 20) + " MiB, pendingFrames=" + this.frames.size()
+                        + "). Cannot safely force-reuse staging memory before Minecraft submits the current frame.");
             }
             this.thisFrameAllocations.add(this.caddr);
             this.offset = size;
@@ -170,7 +168,12 @@ public class VkUploadStream extends AbstractUploadStream {
 
     @Override
     public void free() {
-        this.retireUpTo(Long.MAX_VALUE);
+        //CPU allocator bookkeeping can be discarded immediately because the
+        //stream will never allocate again. The VkBuffer itself is retired by
+        //Minecraft's submission-completion destruction queue.
+        this.frames.clear();
+        this.thisFrameAllocations.clear();
+        this.uploadList.clear();
         this.stagingBuffer.free();
     }
 
