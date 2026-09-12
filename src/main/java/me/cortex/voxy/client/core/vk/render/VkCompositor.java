@@ -267,8 +267,12 @@ public class VkCompositor {
             this.uploadStream.commit();
         }
 
+        //Translucency is conditional and fog-covered frames can skip this
+        //composite entirely, so colourSSAO can have more than one valid prior
+        //producer/layout. Keep the destination precise but use a conservative
+        //source scope rather than assuming a colour-attachment write happened.
         viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
         //Blaze3D's main targets are GENERAL-layout images. Establish attachment
@@ -284,7 +288,7 @@ public class VkCompositor {
                         .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                         .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                         .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-                var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
+                var depthAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
                         .imageView(VkFrameHost.vkView(rt.mcDepth))
                         .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                         .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
