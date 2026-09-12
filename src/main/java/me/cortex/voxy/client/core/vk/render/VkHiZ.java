@@ -5,6 +5,7 @@ import me.cortex.voxy.client.core.vk.VkFrameCtx;
 import me.cortex.voxy.client.core.vk.VkImage2D;
 import me.cortex.voxy.client.core.vk.VkShaderPipeline;
 import me.cortex.voxy.client.core.vk.VkShaderSource;
+import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
 
 import java.util.List;
@@ -13,11 +14,13 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
 //Pure-VK HiZ pyramid: an R32F mip chain reduced with the same conservative
-// REDUCTION as the GL path (min for reverse-Z), built by one small compute
-// dispatch per level. Level 0 reduces from the offscreen depth image directly.
-// The whole pyramid lives in GENERAL layout (written as storage image, read as
-// sampled image by the traversal).
+//REDUCTION as the GL path (min for reverse-Z), built by one small compute
+//dispatch per level. Level 0 reduces from the offscreen depth image directly.
+//The whole pyramid lives in GENERAL layout (written as storage image, read as
+//sampled image by the traversal).
 public class VkHiZ {
+    private static final int RESIZE_RETRY_FRAMES = 30;
+
     private final VkFrameCtx ctx;
     private final VkShaderPipeline reduce;
     private final VkShaderPipeline subgroupReduce; //null when subgroup unsupported
@@ -27,6 +30,7 @@ public class VkHiZ {
     private int levels;
     private int width, height;
     private boolean initialized;
+    private int failedWidth = -1, failedHeight = -1, resizeRetryFrames;
 
     public VkHiZ(VkFrameCtx ctx, RenderProperties properties) {
         this.ctx = ctx;
@@ -65,21 +69,51 @@ public class VkHiZ {
         this.sampler = createdSampler;
     }
 
-    private void alloc(int width, int height) {
+    private boolean alloc(int width, int height) {
+        if (this.pyramid != null && width == this.failedWidth && height == this.failedHeight && this.resizeRetryFrames > 0) {
+            this.resizeRetryFrames--;
+            return false;
+        }
+
         int newLevels = (int) Math.ceil(Math.log(Math.max(width, height)) / Math.log(2));
         newLevels = Math.max(newLevels, 1);
 
-        //Create first, swap second. If allocation fails the current pyramid
-        //remains valid and the viewport can recover on a later frame/resize.
-        VkImage2D newPyramid = new VkImage2D(this.ctx, width, height, newLevels, VK_FORMAT_R32_SFLOAT,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true);
+        //Create first, swap second. If VMA's live-budget guard rejects the new
+        //pyramid, keep the old one. hiz_reduce.comp uses normalized gathering and
+        //therefore supports an arbitrary source:destination ratio at level 0.
+        final VkImage2D newPyramid;
+        try {
+            newPyramid = new VkImage2D(this.ctx, width, height, newLevels, VK_FORMAT_R32_SFLOAT,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true);
+        } catch (RuntimeException failure) {
+            if (this.pyramid == null) throw failure;
+            this.failedWidth = width;
+            this.failedHeight = height;
+            this.resizeRetryFrames = RESIZE_RETRY_FRAMES;
+            try {
+                var budget = this.ctx.vk().deviceLocalBudget();
+                Logger.warn("Voxy VK: keeping previous " + this.width + "x" + this.height
+                        + " Hi-Z pyramid after " + width + "x" + height
+                        + " allocation failed; VMA free=" + (budget.availableBytes() >> 20)
+                        + " MiB (" + failure.getMessage() + ")");
+            } catch (RuntimeException ignored) {
+                Logger.warn("Voxy VK: keeping previous Hi-Z pyramid after resize allocation failed: "
+                        + failure.getMessage());
+            }
+            return false;
+        }
+
         VkImage2D oldPyramid = this.pyramid;
         this.pyramid = newPyramid;
         this.levels = newLevels;
         this.width = width;
         this.height = height;
         this.initialized = false;
+        this.failedWidth = -1;
+        this.failedHeight = -1;
+        this.resizeRetryFrames = 0;
         if (oldPyramid != null) oldPyramid.free();
+        return true;
     }
 
     /**
@@ -188,7 +222,7 @@ public class VkHiZ {
     public void free() {
         if (this.pyramid != null) this.pyramid.free();
         //sampler comes from VkImage2D.createSampler's device-lifetime cache (shared
-        // handle); never destroy it per-object (multi-free vkDestroySampler -> SIGSEGV).
+        //handle); never destroy it per-object (multi-free vkDestroySampler -> SIGSEGV).
         this.reduce.free();
         if (this.subgroupReduce != null) this.subgroupReduce.free();
     }
