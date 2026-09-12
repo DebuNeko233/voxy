@@ -28,45 +28,43 @@ public final class VkFrameHost {
         return VulkanConst.toVk(view.texture().getFormat());
     }
 
-    //Temporarily transitions one of Minecraft's own frame images for sampling,
-    // then callers restore it to its attachment layout before returning control
-    // to Blaze3D. Aspect bits are derived from the actual 26.2 GpuFormat: the
-    // normal main depth target can be D32_FLOAT (depth-only), while other targets
-    // may use D32_FLOAT_S8_UINT/D24_S8. Supplying STENCIL for a depth-only image
-    // is invalid Vulkan usage.
-    public static void transitionMcImage(VkCommandBuffer cmd, GpuTextureView view,
-                                          boolean depth, int oldLayout, int newLayout) {
+    /**
+     * Minecraft 26.2's VulkanGpuTexture keeps images in GENERAL layout for
+     * sampling and attachments. Voxy must not transition those images behind
+     * Blaze3D's back; it only inserts same-layout memory dependencies.
+     */
+    public static void barrierMcImageForSampling(VkCommandBuffer cmd, GpuTextureView view, boolean depth) {
+        int dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        barrierMcImageGeneral(cmd, view, depth,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                dstStage,
+                VK_ACCESS_SHADER_READ_BIT);
+    }
+
+    public static void barrierMcImageForAttachment(VkCommandBuffer cmd, GpuTextureView view, boolean depth) {
+        int dstStage;
+        int dstAccess;
+        if (depth) {
+            dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            dstAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        } else {
+            dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            dstAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        }
+        barrierMcImageGeneral(cmd, view, depth,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                dstStage,
+                dstAccess);
+    }
+
+    private static void barrierMcImageGeneral(VkCommandBuffer cmd, GpuTextureView view, boolean depth,
+                                               int srcStage, int srcAccess,
+                                               int dstStage, int dstAccess) {
         try (MemoryStack stack = stackPush()) {
             var texture = view.texture();
             long image = ((VulkanGpuTexture) texture).vkImage();
-            int srcStage, srcAccess, dstStage, dstAccess;
-            boolean toSampled = newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            if (depth) {
-                if (toSampled) {
-                    srcStage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-                    srcAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-                    dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-                    dstAccess = VK_ACCESS_SHADER_READ_BIT;
-                } else {
-                    srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-                    srcAccess = VK_ACCESS_SHADER_READ_BIT;
-                    dstStage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-                    dstAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-                }
-            } else {
-                if (toSampled) {
-                    srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                    srcAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                    dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-                    dstAccess = VK_ACCESS_SHADER_READ_BIT;
-                } else {
-                    srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-                    srcAccess = VK_ACCESS_SHADER_READ_BIT;
-                    dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                    dstAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                }
-            }
-
             var format = texture.getFormat();
             int aspectMask = 0;
             if (format.hasColorAspect()) aspectMask |= VK_IMAGE_ASPECT_COLOR_BIT;
@@ -83,8 +81,10 @@ public final class VkFrameHost {
             }
 
             var imb = VkImageMemoryBarrier.calloc(1, stack).sType$Default()
-                    .srcAccessMask(srcAccess).dstAccessMask(dstAccess)
-                    .oldLayout(oldLayout).newLayout(newLayout)
+                    .srcAccessMask(srcAccess)
+                    .dstAccessMask(dstAccess)
+                    .oldLayout(VK_IMAGE_LAYOUT_GENERAL)
+                    .newLayout(VK_IMAGE_LAYOUT_GENERAL)
                     .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                     .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                     .image(image);
