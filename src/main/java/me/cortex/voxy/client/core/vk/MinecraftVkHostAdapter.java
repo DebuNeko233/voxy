@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.core.vk;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import me.cortex.voxy.client.mixin.vk.AccessorVulkanCommandEncoder;
 import me.cortex.voxy.client.mixin.vk.AccessorVulkanDevice;
@@ -29,6 +30,7 @@ public final class MinecraftVkHostAdapter implements IVkHost {
 
     @Override
     public VkCommandBuffer frameCommandBuffer() {
+        RenderSystem.assertOnRenderThread();
         var accessor = (AccessorVulkanCommandEncoder) (Object) this.encoder();
         var current = accessor.voxy$currentCommandBuffer();
         //Sodium may legitimately draw no vanilla chunk batches. In that case
@@ -41,6 +43,7 @@ public final class MinecraftVkHostAdapter implements IVkHost {
 
     @Override
     public void deferUntilSubmissionComplete(Runnable action) {
+        RenderSystem.assertOnRenderThread();
         if (action == null) throw new IllegalArgumentException("retirement action is null");
         //Mojang's VulkanCommandEncoder owns a two-slot DestructionQueue. submit()
         //waits the matching timeline-semaphore value before rotating a slot, so
