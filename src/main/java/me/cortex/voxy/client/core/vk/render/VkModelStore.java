@@ -33,35 +33,59 @@ public class VkModelStore implements IModelStore {
     public VkModelStore(VkFrameCtx ctx, VkUploadStream uploadStream) {
         this.ctx = ctx;
         this.uploadStream = uploadStream;
-        this.modelBuffer = new VkBuffer(ctx, IModelStore.MODEL_SIZE * (1L << 16)).zero();
-        this.modelColourBuffer = new VkBuffer(ctx, 4L * (1 << 16)).zero();
-        this.atlas = new VkImage2D(ctx,
-                ModelFactory.MODEL_TEXTURE_SIZE * 3 * 256,
-                ModelFactory.MODEL_TEXTURE_SIZE * 2 * 256,
-                ModelFactory.LAYERS,
-                VK_FORMAT_R8G8B8A8_UNORM,
-                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                VK_IMAGE_ASPECT_COLOR_BIT, false);
-        //Start life in shader-read so the first frame can bind it even with no uploads yet
-        this.atlas.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-        ctx.flushImmediate();
 
-        try (MemoryStack stack = stackPush()) {
-            //Mirror the GL sampler: nearest mag, nearest-within-mip + linear-between-mips min
-            var sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
-                    .magFilter(VK_FILTER_NEAREST)
-                    .minFilter(VK_FILTER_NEAREST)
-                    .mipmapMode(VK_SAMPLER_MIPMAP_MODE_LINEAR)
-                    .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-                    .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-                    .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-                    .minLod(0).maxLod(ModelFactory.LAYERS - 1);
-            var pSampler = stack.mallocLong(1);
-            check(vkCreateSampler(ctx.vk().device, sci, null, pSampler), "vkCreateSampler(modelAtlas)");
-            this.atlasSampler = pSampler.get(0);
+        VkBuffer model = null;
+        VkBuffer colour = null;
+        VkImage2D atlasImage = null;
+        long sampler = VK_NULL_HANDLE;
+        try {
+            model = new VkBuffer(ctx, IModelStore.MODEL_SIZE * (1L << 16)).zero();
+            colour = new VkBuffer(ctx, 4L * (1 << 16)).zero();
+            atlasImage = new VkImage2D(ctx,
+                    ModelFactory.MODEL_TEXTURE_SIZE * 3 * 256,
+                    ModelFactory.MODEL_TEXTURE_SIZE * 2 * 256,
+                    ModelFactory.LAYERS,
+                    VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, false);
+            //Start life in shader-read so the first frame can bind it even with no uploads yet
+            atlasImage.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            ctx.flushImmediate();
+
+            try (MemoryStack stack = stackPush()) {
+                //Mirror the GL sampler: nearest mag, nearest-within-mip + linear-between-mips min
+                var sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
+                        .magFilter(VK_FILTER_NEAREST)
+                        .minFilter(VK_FILTER_NEAREST)
+                        .mipmapMode(VK_SAMPLER_MIPMAP_MODE_LINEAR)
+                        .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                        .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                        .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                        .minLod(0).maxLod(ModelFactory.LAYERS - 1);
+                var pSampler = stack.mallocLong(1);
+                check(vkCreateSampler(ctx.vk().device, sci, null, pSampler), "vkCreateSampler(modelAtlas)");
+                sampler = pSampler.get(0);
+            }
+        } catch (RuntimeException | Error failure) {
+            //The atlas is one of Voxy's largest allocations (~510 MiB at the
+            //current 16px model texture size). Constructor failure must not
+            //strand any of the already-created resources.
+            if (sampler != VK_NULL_HANDLE) {
+                vkDestroySampler(ctx.vk().device, sampler, null);
+            }
+            if (atlasImage != null) atlasImage.free();
+            if (colour != null) colour.free();
+            if (model != null) model.free();
+            ctx.waitIdleRetireAll();
+            throw failure;
         }
+
+        this.modelBuffer = model;
+        this.modelColourBuffer = colour;
+        this.atlas = atlasImage;
+        this.atlasSampler = sampler;
     }
 
     @Override
@@ -89,7 +113,6 @@ public class VkModelStore implements IModelStore {
         int X = (modelId & 0xFF) * TS * 3;
         int Y = ((modelId >> 8) & 0xFF) * TS * 2;
 
-        //Stage the full mip chain in one staging allocation
         int totalBytes = 0;
         for (int lvl = 0; lvl < ModelFactory.LAYERS; lvl++) {
             totalBytes += (TS * TS * 3 * 2 * 4) >> (lvl << 1);
