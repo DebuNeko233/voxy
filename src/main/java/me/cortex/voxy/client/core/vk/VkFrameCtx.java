@@ -231,7 +231,7 @@ public final class VkFrameCtx {
         }
     }
 
-    /** Raw-allocation compatibility path retained until VkImage2D also moves to VMA. */
+    /** Raw-allocation compatibility path retained until every Vulkan image has moved to VMA. */
     public void deferDestroy(long buffer, long memory) {
         if (buffer == VK_NULL_HANDLE && memory == VK_NULL_HANDLE) return;
         this.queueNativeDestroy(() -> {
@@ -247,6 +247,28 @@ public final class VkFrameCtx {
             throw new IllegalArgumentException("Incomplete VMA buffer handle pair");
         }
         this.queueNativeDestroy(() -> Vma.vmaDestroyBuffer(this.ctx.vmaAllocator, buffer, allocation));
+    }
+
+    /**
+     * Retire all views and the VMA image allocation as one ordered callback.
+     * Vulkan requires every image view to be destroyed before its image; keeping
+     * this in one callback avoids relying on ordering between separate queued
+     * destruction actions.
+     */
+    public void deferDestroyVmaImage(long image, long mainView, long allocation, long[] additionalViews) {
+        if (image == VK_NULL_HANDLE && mainView == VK_NULL_HANDLE && allocation == VK_NULL_HANDLE
+                && (additionalViews == null || additionalViews.length == 0)) return;
+        if (image == VK_NULL_HANDLE || allocation == VK_NULL_HANDLE) {
+            throw new IllegalArgumentException("Incomplete VMA image handle pair");
+        }
+        long[] ownedViews = additionalViews == null ? new long[0] : additionalViews.clone();
+        this.queueNativeDestroy(() -> {
+            for (long view : ownedViews) {
+                if (view != VK_NULL_HANDLE) vkDestroyImageView(this.ctx.device, view, null);
+            }
+            if (mainView != VK_NULL_HANDLE) vkDestroyImageView(this.ctx.device, mainView, null);
+            Vma.vmaDestroyImage(this.ctx.vmaAllocator, image, allocation);
+        });
     }
 
     public void deferDestroyImage(long image, long view, long memory) {
