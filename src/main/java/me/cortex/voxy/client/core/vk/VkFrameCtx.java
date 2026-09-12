@@ -18,11 +18,6 @@ import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
-//The per-frame Vulkan recording context for the pure-VK path.
-//
-//ALL of Voxy's GPU work is recorded into MC's live frame command buffer between
-// MC's own render passes. Frame events are also the lifetime boundary for every
-// native object that can still be referenced by an in-flight command buffer.
 public final class VkFrameCtx {
     public interface FrameRetireListener {
         void onFramesRetired(long retiredUpToInclusive);
@@ -78,9 +73,6 @@ public final class VkFrameCtx {
         return this.eventPool.size();
     }
 
-    //==================================================================================
-    // Recording targets
-
     public void beginFrame(VkCommandBuffer mcFrameCommandBuffer) {
         if (this.frameCmd != null) throw new IllegalStateException("Frame already begun");
         this.frameCmd = mcFrameCommandBuffer;
@@ -102,6 +94,7 @@ public final class VkFrameCtx {
         this.anyWorkThisFrame = true;
         if (this.frameCmd != null) return this.frameCmd;
         if (this.immediateCmd == null) {
+            VkCommandBuffer allocated = null;
             try (MemoryStack stack = stackPush()) {
                 var cbai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
                         .commandPool(this.ctx.commandPool)
@@ -109,10 +102,16 @@ public final class VkFrameCtx {
                         .commandBufferCount(1);
                 var pCmd = stack.mallocPointer(1);
                 check(vkAllocateCommandBuffers(this.ctx.device, cbai, pCmd), "vkAllocateCommandBuffers(immediate)");
-                this.immediateCmd = new VkCommandBuffer(pCmd.get(0), this.ctx.device);
+                allocated = new VkCommandBuffer(pCmd.get(0), this.ctx.device);
                 var begin = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                         .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-                check(vkBeginCommandBuffer(this.immediateCmd, begin), "vkBeginCommandBuffer(immediate)");
+                check(vkBeginCommandBuffer(allocated, begin), "vkBeginCommandBuffer(immediate)");
+                this.immediateCmd = allocated;
+            } catch (RuntimeException | Error failure) {
+                if (allocated != null) {
+                    vkFreeCommandBuffers(this.ctx.device, this.ctx.commandPool, allocated);
+                }
+                throw failure;
             }
         }
         return this.immediateCmd;
@@ -122,23 +121,35 @@ public final class VkFrameCtx {
         if (this.immediateCmd == null) return;
         var cmd = this.immediateCmd;
         this.immediateCmd = null;
+        long fence = VK_NULL_HANDLE;
+        boolean submitted = false;
+        boolean completed = false;
         try (MemoryStack stack = stackPush()) {
             check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(immediate)");
             var fci = VkFenceCreateInfo.calloc(stack).sType$Default();
-            var pFence = stack.mallocLong(1);
-            check(vkCreateFence(this.ctx.device, fci, null, pFence), "vkCreateFence(immediate)");
-            long fence = pFence.get(0);
+            var pFence = stack.callocLong(1);
+            int createFence = vkCreateFence(this.ctx.device, fci, null, pFence);
+            fence = pFence.get(0);
+            check(createFence, "vkCreateFence(immediate)");
             var submit = VkSubmitInfo.calloc(stack).sType$Default()
                     .pCommandBuffers(stack.pointers(cmd));
             check(vkQueueSubmit(this.ctx.queue, submit, fence), "vkQueueSubmit(immediate)");
+            submitted = true;
             check(vkWaitForFences(this.ctx.device, fence, true, Long.MAX_VALUE), "vkWaitForFences(immediate)");
-            vkDestroyFence(this.ctx.device, fence, null);
+            completed = true;
+        } finally {
+            //Never free a command buffer that may still be pending. A failed wait
+            // normally means device-lost; queue-idle is a best-effort final sync
+            // before releasing the command-buffer/fence handles.
+            if (submitted && !completed) {
+                vkQueueWaitIdle(this.ctx.queue);
+            }
+            if (fence != VK_NULL_HANDLE) {
+                vkDestroyFence(this.ctx.device, fence, null);
+            }
             vkFreeCommandBuffers(this.ctx.device, this.ctx.commandPool, cmd);
         }
     }
-
-    //==================================================================================
-    // Frame retirement
 
     public void pollRetired() {
         boolean any = false;
@@ -152,9 +163,7 @@ public final class VkFrameCtx {
             this.retiredCounter = frame.frameIdx;
             any = true;
         }
-        if (any) {
-            this.runRetirement();
-        }
+        if (any) this.runRetirement();
     }
 
     public void waitIdleRetireAll() {
@@ -208,9 +217,6 @@ public final class VkFrameCtx {
         }
     }
 
-    //==================================================================================
-    // Deferred destruction
-
     public void deferDestroy(long buffer, long memory) {
         this.pendingDestroys.add(new PendingDestroy(this.frameCounter, buffer, VK_NULL_HANDLE, VK_NULL_HANDLE, memory));
     }
@@ -219,18 +225,10 @@ public final class VkFrameCtx {
         this.pendingDestroys.add(new PendingDestroy(this.frameCounter, VK_NULL_HANDLE, image, view, memory));
     }
 
-    /**
-     * Pipelines can be replaced while older Minecraft frame command buffers are
-     * still in flight. Destroy them only after the Voxy frame that last could
-     * reference them has retired.
-     */
     public void deferDestroyPipeline(long pipeline, long pipelineLayout, long[] modules) {
         this.pendingPipelineDestroys.add(new PendingPipelineDestroy(
                 this.frameCounter, pipeline, pipelineLayout, modules == null ? null : modules.clone()));
     }
-
-    //==================================================================================
-    // Command helpers
 
     public void fillBuffer(VkBuffer buffer, long offset, long size, int value) {
         vkCmdFillBuffer(this.cmd(), buffer.buffer, offset, size, value);
