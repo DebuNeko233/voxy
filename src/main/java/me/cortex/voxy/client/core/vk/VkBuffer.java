@@ -33,6 +33,7 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
     public final long memory;
     private final long size;
     private final long allocationSize;
+    private long mappedAddress;
 
     private static int COUNT;
     private static long TOTAL_SIZE;
@@ -71,12 +72,6 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
             allocatedMemory = pMem.get(0);
             check(vkBindBufferMemory(vctx.device, createdBuffer, allocatedMemory, 0), "vkBindBufferMemory");
         } catch (RuntimeException | Error failure) {
-            //VkSectionGeometryData deliberately retries with a smaller allocation
-            //when a large device-local buffer cannot be allocated. A failed
-            //constructor must therefore be transactional: otherwise every retry
-            //leaves the already-created VkBuffer (or VkDeviceMemory after a bind
-            //failure) alive and turns a recoverable OOM into persistent VRAM
-            //pressure. Destroy the bound resource before freeing its memory.
             if (createdBuffer != VK_NULL_HANDLE) {
                 vkDestroyBuffer(vctx.device, createdBuffer, null);
             }
@@ -94,12 +89,14 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
         TOTAL_ALLOCATION_SIZE += allocatedBytes;
     }
 
-    /** Maps the whole buffer; only valid for hostVisible buffers. */
+    /** Maps the whole buffer; only valid for host-visible buffers. */
     public long map() {
+        if (this.mappedAddress != 0) return this.mappedAddress;
         try (MemoryStack stack = stackPush()) {
             var pp = stack.mallocPointer(1);
             check(vkMapMemory(this.ctx.vk().device, this.memory, 0, this.size, 0, pp), "vkMapMemory");
-            return pp.get(0);
+            this.mappedAddress = pp.get(0);
+            return this.mappedAddress;
         }
     }
 
@@ -140,6 +137,13 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
     @Override
     public void free() {
         this.free0();
+        if (this.mappedAddress != 0) {
+            //Host-visible upload/readback buffers are persistently mapped during
+            //their lifetime. Unmap before the deferred VkDeviceMemory free; GPU
+            //access to the allocation remains valid until retirement destroys it.
+            vkUnmapMemory(this.ctx.vk().device, this.memory);
+            this.mappedAddress = 0;
+        }
         COUNT--;
         TOTAL_SIZE -= this.size;
         TOTAL_ALLOCATION_SIZE -= this.allocationSize;
