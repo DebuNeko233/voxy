@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.core.vk;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkCommandBuffer;
@@ -85,6 +86,7 @@ public final class VkFrameCtx {
     }
 
     public void beginFrame(VkCommandBuffer mcFrameCommandBuffer) {
+        RenderSystem.assertOnRenderThread();
         this.throwDeferredFailure();
         if (this.closed) throw new IllegalStateException("VkFrameCtx is closed");
         if (this.frameCmd != null) throw new IllegalStateException("Frame already begun");
@@ -100,6 +102,7 @@ public final class VkFrameCtx {
      * completed according to Blaze3D's timeline semaphore.
      */
     public void endFrame() {
+        RenderSystem.assertOnRenderThread();
         if (this.frameCmd == null) throw new IllegalStateException("No frame begun");
         this.frameCmd = null;
         if (!this.anyWorkThisFrame) return;
@@ -120,9 +123,10 @@ public final class VkFrameCtx {
             if (this.closed) return;
             this.retiredCounter = Math.max(this.retiredCounter, frameIdx);
             Throwable failure = null;
-            //A readback listener is application code. Never throw from Mojang's
-            // DestructionQueue callback: doing so could abort Minecraft's own
-            // destruction-queue rotation. Aggregate and surface on next Voxy use.
+            //A readback listener is application logic and may fail. Never throw
+            //from Mojang's DestructionQueue callback: doing so could abort
+            //Minecraft's own destruction-queue rotation. Aggregate and surface
+            //the error on the next Voxy call instead.
             for (var listener : this.retireListeners) {
                 try {
                     listener.onFramesRetired(this.retiredCounter);
@@ -139,9 +143,12 @@ public final class VkFrameCtx {
     /**
      * Current recording target. Inside beginFrame/endFrame this is Minecraft's
      * command buffer. Outside a frame Voxy uses a private one-shot command buffer
-     * and waits its own fence synchronously in flushImmediate().
+     * and waits its own fence synchronously in flushImmediate(). Both paths are
+     * render-thread-only: VkQueue and the adopted Minecraft encoder are externally
+     * synchronized Vulkan objects.
      */
     public VkCommandBuffer cmd() {
+        RenderSystem.assertOnRenderThread();
         if (this.closed) throw new IllegalStateException("VkFrameCtx is closed");
         if (this.frameCmd != null) {
             this.anyWorkThisFrame = true;
@@ -172,6 +179,7 @@ public final class VkFrameCtx {
     }
 
     public void flushImmediate() {
+        RenderSystem.assertOnRenderThread();
         this.throwDeferredFailure();
         if (this.immediateCmd == null) return;
         var cmd = this.immediateCmd;
@@ -205,6 +213,7 @@ public final class VkFrameCtx {
 
     /** Host callbacks execute during Minecraft submit; polling is now only an error checkpoint. */
     public void pollRetired() {
+        RenderSystem.assertOnRenderThread();
         this.throwDeferredFailure();
     }
 
@@ -215,6 +224,7 @@ public final class VkFrameCtx {
      * reusable.
      */
     public void waitIdleRetireAll() {
+        RenderSystem.assertOnRenderThread();
         if (this.frameCmd != null) {
             throw new IllegalStateException("Cannot wait/retire while Minecraft frame is still being recorded");
         }
@@ -247,6 +257,7 @@ public final class VkFrameCtx {
     }
 
     private void queueNativeDestroy(Runnable destroy) {
+        RenderSystem.assertOnRenderThread();
         this.pendingNativeDestroys++;
         try {
             this.ctx.deferUntilSubmissionComplete(() -> {
@@ -329,6 +340,7 @@ public final class VkFrameCtx {
     }
 
     public void free() {
+        RenderSystem.assertOnRenderThread();
         if (this.frameCmd != null) {
             throw new IllegalStateException("Cannot free VkFrameCtx while a Minecraft frame is being recorded");
         }
@@ -340,7 +352,7 @@ public final class VkFrameCtx {
         this.closed = true;
         this.retireListeners.clear();
         //Native destroys and old frame-completion callbacks already queued in
-        // Minecraft remain valid: their closures own the raw handles they need.
-        // Completion callbacks observe closed=true and become no-ops.
+        //Minecraft remain valid: their closures own the raw handles they need.
+        //Completion callbacks observe closed=true and become no-ops.
     }
 }
