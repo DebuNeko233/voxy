@@ -33,7 +33,9 @@ fi
 chmod +x ./gradlew 2>/dev/null || true
 
 echo "[1/3] Building Voxy with Gradle..."
-./gradlew clean build -PincludeOtherArchs=true --stacktrace "$@"
+# Build for the current platform. The optional includeOtherArchs flag is reserved
+# for dedicated universal/release packaging and should not be forced here.
+./gradlew clean build --stacktrace "$@"
 
 echo "[2/3] Locating the remapped mod JAR..."
 MOD_JAR=""
