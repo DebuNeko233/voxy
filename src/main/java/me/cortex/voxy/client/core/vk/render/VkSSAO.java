@@ -135,13 +135,17 @@ public class VkSSAO {
         viewport.depthStencil.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        //colourSSAO can arrive here from the previous frame's sampled composite,
+        //from a colour-attachment pass, or from a fog-covered frame where the
+        //composite was skipped. Use a conservative source scope for this one
+        //conditional state machine instead of guessing the previous pass.
         viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
 
         if (this.isBetterSSAO) {
             //Minecraft's main depth image remains GENERAL; only synchronize its
-            //previous attachment writes before the compute shader samples it.
+            //previous attachment writes for sampling by this compute pass.
             VkFrameHost.barrierMcImageForSampling(cmd, rt.mcDepth(), true);
         }
 
