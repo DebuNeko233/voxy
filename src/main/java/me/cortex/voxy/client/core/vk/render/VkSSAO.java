@@ -30,7 +30,7 @@ public class VkSSAO {
     private final VkBuffer params;
     private final long colourSampler;
     private final long depthSampler;
-    private final Matrix4f invScratch = new Matrix4f();//per-frame matrix inversion scratch (avoids a heap alloc each compute())
+    private final Matrix4f invScratch = new Matrix4f();
 
     public VkSSAO(VkFrameCtx ctx, VkUploadStream uploadStream, RenderProperties properties, SSAO.SSAOMode mode) {
         this.ctx = ctx;
@@ -50,7 +50,6 @@ public class VkSSAO {
         }
         String src = VkShaderSource.load("voxy:post/ssao.comp", defs.build());
         if (this.isBetterSSAO) {
-            //Same compile-time sample disk the GL builder splices in via replace()
             src = src.replace("%%CONST_ARRAY%%", generateSamplePoints(this.spp));
         }
 
@@ -68,8 +67,7 @@ public class VkSSAO {
             createdPipeline = new VkShaderPipeline(ctx, "ssao.comp", src, 0, bindings);
             createdParams = new VkBuffer(ctx, 256).zero();
             ctx.flushImmediate();
-            createdColourSampler = VkImage2D.createSampler(ctx.vk(), false, false);//nearest (GL colourTex is NEAREST)
-            //GL: better -> NEAREST(+mip), basic -> LINEAR; our targets are single-mip
+            createdColourSampler = VkImage2D.createSampler(ctx.vk(), false, false);
             createdDepthSampler = VkImage2D.createSampler(ctx.vk(), false, !this.isBetterSSAO);
         } catch (RuntimeException | Error failure) {
             if (createdParams != null) {
@@ -111,15 +109,10 @@ public class VkSSAO {
         return array.toString();
     }
 
-    /**
-     * Records the SSAO dispatch: colour+depth (and MC depth for BETTER) sampled,
-     * colourSSAO written. Leaves colourSSAO in COLOR_ATTACHMENT layout for the
-     * translucent pass and the offscreen depth back in attachment layout.
-     */
     public void compute(VkViewport viewport, VkCompositor.VkViewportRT rt) {
         var cmd = this.ctx.cmd();
 
-        {//params UBO: BASIC = MVP,invMVP; BETTER = Proj,invProj,MV,sourceInvProj
+        {
             long ptr = this.uploadStream.upload(this.params, 0, 256);
             var scratch = this.invScratch;
             if (this.isBetterSSAO) {
@@ -145,35 +138,40 @@ public class VkSSAO {
         viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        boolean mcDepthSampled = false;
         if (this.isBetterSSAO) {
             VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            mcDepthSampled = true;
         }
 
-        this.pipeline.bind(cmd);
-        try (var b = this.pipeline.binder()) {
-            b.image(0, viewport.colourSSAO.view)
-                    .sampler(1, viewport.colour.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .sampler(2, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            if (this.isBetterSSAO) {
-                b.sampler(3, VkFrameHost.vkView(rt.mcDepth()), this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        try {
+            this.pipeline.bind(cmd);
+            try (var b = this.pipeline.binder()) {
+                b.image(0, viewport.colourSSAO.view)
+                        .sampler(1, viewport.colour.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .sampler(2, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                if (this.isBetterSSAO) {
+                    b.sampler(3, VkFrameHost.vkView(rt.mcDepth()), this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                }
+                b.ubo(4, this.params).push(cmd);
             }
-            b.ubo(4, this.params).push(cmd);
+            vkCmdDispatch(cmd, (viewport.width + 7) / 8, (viewport.height + 7) / 8, 1);
+        } finally {
+            if (mcDepthSampled) {
+                VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            }
+            viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+            viewport.depthStencil.transition(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
         }
-        vkCmdDispatch(cmd, (viewport.width + 7) / 8, (viewport.height + 7) / 8, 1);
-
-        if (this.isBetterSSAO) {
-            VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        }
-        viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-        viewport.depthStencil.transition(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
     }
 
     public void addDebugInfo(List<String> debugLines) {
@@ -183,7 +181,5 @@ public class VkSSAO {
     public void free() {
         this.pipeline.free();
         this.params.free();
-        //colourSampler/depthSampler come from VkImage2D.createSampler's device-lifetime
-        // cache (shared handles); never destroy them per-object (multi-free -> SIGSEGV).
     }
 }
