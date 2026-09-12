@@ -14,22 +14,12 @@ import static org.lwjgl.vulkan.KHRPushDescriptor.VK_DESCRIPTOR_SET_LAYOUT_CREATE
 import static org.lwjgl.vulkan.KHRPushDescriptor.vkCmdPushDescriptorSetKHR;
 import static org.lwjgl.vulkan.VK10.*;
 
-//Unified pipeline wrapper for the pure-VK path: an explicit binding table
-// (set 0, push descriptors — required by MC 26.2's own Vulkan backend, so
-// always present on an adopted device), an optional push-constant range, and
-// either a compute stage or a vert+frag pair with dynamic rendering.
-//
-//Binding numbers mirror the (possibly remapped) layout(binding=N) declarations
-// of the VK shader variants; see assets/voxy/shaders/lod/vk/.
 public final class VkShaderPipeline {
     public static final int T_UBO = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     public static final int T_SSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     public static final int T_SAMPLER = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     public static final int T_IMAGE = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 
-    //Interned descriptorSetLayout cache keyed by (device, binding-hash) so
-    // pipelines sharing a binding table reuse one layout handle. The cache is
-    // explicitly destroyed when the adopted Voxy Vulkan context is torn down.
     private static final java.util.Map<Long, java.util.Map<Long, Long>> LAYOUT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
     private final VkFrameCtx ctx;
@@ -46,8 +36,6 @@ public final class VkShaderPipeline {
     public static Binding ssbo(int b) { return new Binding(b, T_SSBO); }
     public static Binding sampler(int b) { return new Binding(b, T_SAMPLER); }
     public static Binding image(int b) { return new Binding(b, T_IMAGE); }
-
-    //=============================== Compute ===============================
 
     public VkShaderPipeline(VkFrameCtx ctx, String name, String computeGlsl, int pushConstantBytes, List<Binding> bindings) {
         this.ctx = ctx;
@@ -83,22 +71,20 @@ public final class VkShaderPipeline {
         this.pipeline = createdPipeline;
     }
 
-    //=============================== Graphics ===============================
-
     public static final class GfxDesc {
         public String name;
         public String vertGlsl, fragGlsl;
         public int pushConstantBytes;
         public List<Binding> bindings = new ArrayList<>();
-        public int colorFormat;           //VK_FORMAT_UNDEFINED for depth-only
-        public int depthFormat;           //VK_FORMAT_UNDEFINED for no depth attachment
-        public int stencilFormat;         //VK_FORMAT_UNDEFINED unless depth-stencil has stencil
+        public int colorFormat;
+        public int depthFormat;
+        public int stencilFormat;
         public boolean depthTest = true, depthWrite = true;
         public int depthCompare = VK_COMPARE_OP_LESS_OR_EQUAL;
-        public boolean blend = false;      //standard alpha blend when true
+        public boolean blend = false;
         public boolean colorWrite = true;
-        public boolean stencilTestEqual1 = false;//stencil func EQUAL ref=1, keep (LOD terrain masking)
-        public boolean stencilWriteAlways1 = false;//stencil ALWAYS -> write stencilWriteRef (depth setup pass)
+        public boolean stencilTestEqual1 = false;
+        public boolean stencilWriteAlways1 = false;
         public int stencilWriteRef = 1;
         public int topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     }
@@ -132,10 +118,9 @@ public final class VkShaderPipeline {
             stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertModule).pName(stack.UTF8("main"));
             stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragModule).pName(stack.UTF8("main"));
 
-            var vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default();//vertex pulling
+            var vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default();
             var inputAssembly = VkPipelineInputAssemblyStateCreateInfo.calloc(stack).sType$Default()
-                    .topology(d.topology)
-                    .primitiveRestartEnable(isStripTopology(d.topology));
+                    .topology(d.topology).primitiveRestartEnable(isStripTopology(d.topology));
             var dynamicState = VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default()
                     .pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR));
             var viewportState = VkPipelineViewportStateCreateInfo.calloc(stack).sType$Default()
@@ -162,8 +147,7 @@ public final class VkShaderPipeline {
             }
 
             var blendAttach = VkPipelineColorBlendAttachmentState.calloc(1, stack)
-                    .colorWriteMask(d.colorWrite ? 0xF : 0)
-                    .blendEnable(d.blend);
+                    .colorWriteMask(d.colorWrite ? 0xF : 0).blendEnable(d.blend);
             if (d.blend) {
                 blendAttach.srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
                         .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
@@ -173,13 +157,10 @@ public final class VkShaderPipeline {
                         .alphaBlendOp(VK_BLEND_OP_ADD);
             }
             var blend = VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default();
-            if (d.colorFormat != VK_FORMAT_UNDEFINED) {
-                blend.pAttachments(blendAttach);
-            }
+            if (d.colorFormat != VK_FORMAT_UNDEFINED) blend.pAttachments(blendAttach);
 
             var rendering = VkPipelineRenderingCreateInfoKHR.calloc(stack).sType$Default()
-                    .depthAttachmentFormat(d.depthFormat)
-                    .stencilAttachmentFormat(d.stencilFormat);
+                    .depthAttachmentFormat(d.depthFormat).stencilAttachmentFormat(d.stencilFormat);
             if (d.colorFormat != VK_FORMAT_UNDEFINED) {
                 rendering.colorAttachmentCount(1).pColorAttachmentFormats(stack.ints(d.colorFormat));
             }
@@ -214,8 +195,6 @@ public final class VkShaderPipeline {
         this.pipeline = createdPipeline;
     }
 
-    //=============================== Shared ===============================
-
     private static long createModule(VulkanContext vctx, ByteBuffer spv, MemoryStack stack) {
         var smci = VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(spv);
         var pMod = stack.mallocLong(1);
@@ -225,9 +204,7 @@ public final class VkShaderPipeline {
 
     private static long createSetLayout(VulkanContext vctx, MemoryStack stack, List<Binding> bindings, int stages) {
         long key = stages;
-        for (var b : bindings) {
-            key = key * 31L + b.binding() * 7L + b.type();
-        }
+        for (var b : bindings) key = key * 31L + b.binding() * 7L + b.type();
         long deviceAddr = vctx.device.address();
         var perDevice = LAYOUT_CACHE.computeIfAbsent(deviceAddr, k -> new java.util.concurrent.ConcurrentHashMap<>());
         Long cached = perDevice.get(key);
@@ -239,8 +216,7 @@ public final class VkShaderPipeline {
             lb.get(i).binding(b.binding()).descriptorType(b.type()).descriptorCount(1).stageFlags(stages);
         }
         var dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default()
-                .flags(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
-                .pBindings(lb);
+                .flags(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR).pBindings(lb);
         var pDsl = stack.mallocLong(1);
         check(vkCreateDescriptorSetLayout(vctx.device, dslci, null, pDsl), "vkCreateDescriptorSetLayout");
         long handle = pDsl.get(0);
@@ -252,13 +228,10 @@ public final class VkShaderPipeline {
         return handle;
     }
 
-    /** Destroy descriptor-set layouts interned for this adopted VkDevice. */
     public static void destroyCachedLayouts(VulkanContext ctx) {
         var perDevice = LAYOUT_CACHE.remove(ctx.device.address());
         if (perDevice == null) return;
-        for (long layout : perDevice.values()) {
-            vkDestroyDescriptorSetLayout(ctx.device, layout, null);
-        }
+        for (long layout : perDevice.values()) vkDestroyDescriptorSetLayout(ctx.device, layout, null);
         perDevice.clear();
     }
 
@@ -281,7 +254,6 @@ public final class VkShaderPipeline {
         vkCmdPushConstants(cmd, this.pipelineLayout, this.pushStages, 0, data);
     }
 
-    /** Accumulates descriptor writes then pushes them; render-thread scratch use only. */
     public Binder binder() {
         return new Binder(this);
     }
@@ -325,9 +297,7 @@ public final class VkShaderPipeline {
 
         public void push(VkCommandBuffer cmd) {
             var buf = VkWriteDescriptorSet.calloc(this.writes.size(), this.stack);
-            for (int i = 0; i < this.writes.size(); i++) {
-                buf.put(i, this.writes.get(i));
-            }
+            for (int i = 0; i < this.writes.size(); i++) buf.put(i, this.writes.get(i));
             vkCmdPushDescriptorSetKHR(cmd,
                     this.owner.compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
                     this.owner.pipelineLayout, 0, buf);
@@ -340,13 +310,10 @@ public final class VkShaderPipeline {
     }
 
     public void free() {
-        var device = this.ctx.vk().device;
-        vkDestroyPipeline(device, this.pipeline, null);
-        vkDestroyPipelineLayout(device, this.pipelineLayout, null);
-        //descriptorSetLayout is interned and destroyed once per adopted device by
-        // VulkanContext.destroy(), after every pipeline has been freed.
-        for (long module : this.modules) {
-            vkDestroyShaderModule(device, module, null);
-        }
+        //Do not destroy immediately: Minecraft can have older submitted frame
+        // command buffers still referencing this pipeline after a format-driven
+        // pipeline replacement. VkFrameCtx retires it with the last Voxy frame
+        // that could have recorded the handle.
+        this.ctx.deferDestroyPipeline(this.pipeline, this.pipelineLayout, this.modules);
     }
 }
