@@ -27,22 +27,35 @@ public class VkNodeGpuOps implements INodeGpuOps {
     public VkNodeGpuOps(VkFrameCtx ctx, VkUploadStream uploadStream) {
         this.ctx = ctx;
         this.uploadStream = uploadStream;
-        this.scatterWrite = new VkShaderPipeline(ctx, "scatter.comp",
-                VkShaderSource.load("voxy:util/scatter.comp", VkShaderSource.defs()
-                        .def("INPUT_BUFFER_BINDING", 0)
-                        .def("OUTPUT_BUFFER1_BINDING", 1)
-                        .def("OUTPUT_BUFFER2_BINDING", 2)
-                        .build()),
-                4,
-                List.of(VkShaderPipeline.ssbo(0), VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(2)));
-        this.multiMemcpy = new VkShaderPipeline(ctx, "memcpy.comp",
-                VkShaderSource.load("voxy:util/memcpy.comp", VkShaderSource.defs()
-                        .def("INPUT_HEADER_BUFFER_BINDING", 0)
-                        .def("INPUT_DATA_BUFFER_BINDING", 1)
-                        .def("OUTPUT_BUFFER_BINDING", 2)
-                        .build()),
-                0,
-                List.of(VkShaderPipeline.ssbo(0), VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(2)));
+
+        VkShaderPipeline scatter = null;
+        VkShaderPipeline memcpy = null;
+        try {
+            scatter = new VkShaderPipeline(ctx, "scatter.comp",
+                    VkShaderSource.load("voxy:util/scatter.comp", VkShaderSource.defs()
+                            .def("INPUT_BUFFER_BINDING", 0)
+                            .def("OUTPUT_BUFFER1_BINDING", 1)
+                            .def("OUTPUT_BUFFER2_BINDING", 2)
+                            .build()),
+                    4,
+                    List.of(VkShaderPipeline.ssbo(0), VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(2)));
+            memcpy = new VkShaderPipeline(ctx, "memcpy.comp",
+                    VkShaderSource.load("voxy:util/memcpy.comp", VkShaderSource.defs()
+                            .def("INPUT_HEADER_BUFFER_BINDING", 0)
+                            .def("INPUT_DATA_BUFFER_BINDING", 1)
+                            .def("OUTPUT_BUFFER_BINDING", 2)
+                            .build()),
+                    0,
+                    List.of(VkShaderPipeline.ssbo(0), VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(2)));
+        } catch (RuntimeException | Error failure) {
+            if (memcpy != null) memcpy.free();
+            if (scatter != null) scatter.free();
+            ctx.waitIdleRetireAll();
+            throw failure;
+        }
+
+        this.scatterWrite = scatter;
+        this.multiMemcpy = memcpy;
     }
 
     @Override
@@ -67,15 +80,13 @@ public class VkNodeGpuOps implements INodeGpuOps {
                     .push(cmd);
         }
         vkCmdDispatch(cmd, copies, 1, 1);
-        //Next consumer is the scatterWrite compute pass (or the cleaner); scope to
-        // COMPUTE -> COMPUTE so unrelated raster/transfer can overlap.
         this.ctx.computeToComputeBarrier();
     }
 
     @Override
     public void scatterWrite(long chunksPtr, int count, IDeviceBuffer nodeBuffer, IBasicGeometryData geometry) {
         int chunks = (count + 3) / 4;
-        int streamSize = chunks * 80;//80 bytes per chunk
+        int streamSize = chunks * 80;
         long off = this.uploadStream.rawUploadAddress(streamSize);
         UnsafeUtil.memcpy(chunksPtr, this.uploadStream.getBaseAddress() + off, streamSize);
         this.uploadStream.commit();
@@ -92,7 +103,6 @@ public class VkNodeGpuOps implements INodeGpuOps {
             this.scatterWrite.pushConstants(cmd, stack.malloc(4).putInt(0, count));
         }
         vkCmdDispatch(cmd, (count + 127) / 128, 1, 1);
-        //Next consumer is the node cleaner / next-frame traversal (both compute).
         this.ctx.computeToComputeBarrier();
     }
 
