@@ -7,6 +7,7 @@ import me.cortex.voxy.client.core.vk.VkBuffer;
 import me.cortex.voxy.client.core.vk.VkFrameCtx;
 import me.cortex.voxy.client.core.vk.VkImage2D;
 import me.cortex.voxy.client.core.vk.VkUploadStream;
+import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -29,6 +30,7 @@ public class VkModelStore implements IModelStore {
     final VkImage2D atlas;
     public final long atlasSampler;
     private boolean inUploadBatch;
+    private boolean freed;
 
     public VkModelStore(VkFrameCtx ctx, VkUploadStream uploadStream) {
         this.ctx = ctx;
@@ -148,7 +150,21 @@ public class VkModelStore implements IModelStore {
 
     @Override
     public void free() {
-        vkDestroySampler(this.ctx.vk().device, this.atlasSampler, null);
+        if (this.freed) return;
+        this.freed = true;
+        final long sampler = this.atlasSampler;
+        if (sampler != VK_NULL_HANDLE) {
+            //The sampler is referenced by submitted terrain descriptors, so its
+            //lifetime follows Minecraft's graphics submission just like buffers
+            //and images. Never destroy it immediately during renderer shutdown.
+            this.ctx.vk().deferUntilSubmissionComplete(() -> {
+                try {
+                    vkDestroySampler(this.ctx.vk().device, sampler, null);
+                } catch (RuntimeException | Error failure) {
+                    Logger.error("Failed to destroy retired Vulkan model-atlas sampler", failure);
+                }
+            });
+        }
         this.modelBuffer.free();
         this.modelColourBuffer.free();
         this.atlas.free();
