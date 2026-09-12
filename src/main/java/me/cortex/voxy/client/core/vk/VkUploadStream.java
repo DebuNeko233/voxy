@@ -60,6 +60,8 @@ public class VkUploadStream extends AbstractUploadStream {
 
     @Override
     public long upload(IDeviceBuffer buffer, long destOffset, long size) {
+        if (size <= 0 || size > Integer.MAX_VALUE) throw new IllegalArgumentException("Invalid Vulkan upload size: " + size);
+        if (destOffset < 0 || destOffset > buffer.sizeBytes() - size) throw new IllegalArgumentException("Vulkan upload exceeds destination buffer");
         long addr = this.rawUploadAddress((int) size);
         this.uploadList.add(new UploadData((VkBuffer) buffer, addr, destOffset, size));
         return this.stagingPtr + addr;
@@ -92,7 +94,8 @@ public class VkUploadStream extends AbstractUploadStream {
             addr = this.caddr + this.offset;
             this.offset += size;
         }
-        if (this.caddr + size > this.stagingBuffer.size()) throw new IllegalStateException();
+        //Check the full coalesced allocation, not just the latest increment.
+        if (this.caddr + this.offset > this.stagingBuffer.size()) throw new IllegalStateException("Vulkan upload staging allocation exceeded buffer");
         return addr;
     }
 
