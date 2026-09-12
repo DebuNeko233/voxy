@@ -288,7 +288,7 @@ public class VkCompositor {
                         .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                         .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                         .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-                var depthAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+                var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                         .imageView(VkFrameHost.vkView(rt.mcDepth))
                         .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                         .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
