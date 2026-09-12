@@ -28,8 +28,8 @@ public final class VkShaderPipeline {
     public static final int T_IMAGE = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 
     //Interned descriptorSetLayout cache keyed by (device, binding-hash) so
-    // pipelines sharing a binding table reuse one layout handle (and skip
-    // re-creating + later destroying it). Lives for the device lifetime.
+    // pipelines sharing a binding table reuse one layout handle. The cache is
+    // explicitly destroyed when the adopted Voxy Vulkan context is torn down.
     private static final java.util.Map<Long, java.util.Map<Long, Long>> LAYOUT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
     private final VkFrameCtx ctx;
@@ -113,19 +113,15 @@ public final class VkShaderPipeline {
             stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragModule).pName(stack.UTF8("main"));
 
             var vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default();//vertex pulling
-            //MoltenVK/Metal cannot disable primitive restart for strip/fan topologies (VK_ERROR_FEATURE_NOT_PRESENT),
-            //so enable it for those. It must stay VK_FALSE for list topologies (spec VUID-...-topology-06252 without
-            //primitiveTopologyListRestart). Restart has no effect on our non-indexed strip draws, so this is safe.
             var inputAssembly = VkPipelineInputAssemblyStateCreateInfo.calloc(stack).sType$Default()
                     .topology(d.topology)
                     .primitiveRestartEnable(isStripTopology(d.topology));
-            //Dynamic viewport+scissor: one pipeline survives resizes
             var dynamicState = VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default()
                     .pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR));
             var viewportState = VkPipelineViewportStateCreateInfo.calloc(stack).sType$Default()
                     .viewportCount(1).scissorCount(1);
             var raster = VkPipelineRasterizationStateCreateInfo.calloc(stack).sType$Default()
-                    .polygonMode(VK_POLYGON_MODE_FILL).cullMode(VK_CULL_MODE_NONE)//GL path disables cull face
+                    .polygonMode(VK_POLYGON_MODE_FILL).cullMode(VK_CULL_MODE_NONE)
                     .frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE).lineWidth(1);
             var msaa = VkPipelineMultisampleStateCreateInfo.calloc(stack).sType$Default()
                     .rasterizationSamples(VK_SAMPLE_COUNT_1_BIT);
@@ -196,10 +192,6 @@ public final class VkShaderPipeline {
     }
 
     private static long createSetLayout(VulkanContext vctx, MemoryStack stack, List<Binding> bindings, int stages) {
-        //Intern by (bindings hash + stages): pipelines with identical binding
-        // tables (e.g. terrainOpaque and terrainTranslucent share the same
-        // bindings list) reuse one VkDescriptorSetLayout handle instead of each
-        // building + destroying its own.
         long key = stages;
         for (var b : bindings) {
             key = key * 31L + b.binding() * 7L + b.type();
@@ -220,8 +212,22 @@ public final class VkShaderPipeline {
         var pDsl = stack.mallocLong(1);
         check(vkCreateDescriptorSetLayout(vctx.device, dslci, null, pDsl), "vkCreateDescriptorSetLayout");
         long handle = pDsl.get(0);
-        perDevice.put(key, handle);
+        Long raced = perDevice.putIfAbsent(key, handle);
+        if (raced != null) {
+            vkDestroyDescriptorSetLayout(vctx.device, handle, null);
+            return raced;
+        }
         return handle;
+    }
+
+    /** Destroy descriptor-set layouts interned for this adopted VkDevice. */
+    public static void destroyCachedLayouts(VulkanContext ctx) {
+        var perDevice = LAYOUT_CACHE.remove(ctx.device.address());
+        if (perDevice == null) return;
+        for (long layout : perDevice.values()) {
+            vkDestroyDescriptorSetLayout(ctx.device, layout, null);
+        }
+        perDevice.clear();
     }
 
     private static long createPipelineLayout(VulkanContext vctx, MemoryStack stack, long setLayout, int pushBytes, int pushStages) {
@@ -305,9 +311,8 @@ public final class VkShaderPipeline {
         var device = this.ctx.vk().device;
         vkDestroyPipeline(device, this.pipeline, null);
         vkDestroyPipelineLayout(device, this.pipelineLayout, null);
-        //descriptorSetLayout is interned (shared across pipelines with identical
-        // bindings); never freed per-pipeline. Leaks are bounded by the device
-        // lifetime and the binding-table cardinality (a handful of distinct layouts).
+        //descriptorSetLayout is interned and destroyed once per adopted device by
+        // VulkanContext.destroy(), after every pipeline has been freed.
         for (long module : this.modules) {
             vkDestroyShaderModule(device, module, null);
         }
