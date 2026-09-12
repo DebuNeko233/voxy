@@ -2,21 +2,15 @@ package me.cortex.voxy.client.core.vk;
 
 import me.cortex.voxy.common.Logger;
 
-//Capability detection + lifecycle for the Vulkan backend.
-//Voxy follows Minecraft's own graphics API: when MC runs on its 26.2 Vulkan
-// backend every rendering mod draws through Blaze3D on Vulkan (no GL context
-// exists in the process), so Voxy adopts MC's VkDevice/queue via IVkHost instead
-// of creating its own. When MC is on OpenGL Voxy uses its OpenGL (MDIC) backend.
-//There is no fallback either way: a GL context cannot exist while MC is on Vulkan.
+//Capability detection + lifecycle for the Vulkan backend. Voxy adopts
+//Minecraft's live Vulkan device and never owns/destroys the VkDevice itself.
 public final class VulkanBackend {
     private static Boolean supported;
     private static VulkanContext context;
     private static String unsupportedReason = "not probed";
 
     public static boolean shouldUseVulkan() {
-        if (!MinecraftVkHost.isMinecraftOnVulkan()) {
-            return false;
-        }
+        if (!MinecraftVkHost.isMinecraftOnVulkan()) return false;
         if (MinecraftVkHost.get() == null) {
             Logger.info("Voxy: Minecraft on Vulkan but host adapter not yet registered");
             return false;
@@ -39,6 +33,7 @@ public final class VulkanBackend {
                     Logger.info("Voxy Vulkan backend adopting Minecraft's device: " + context.deviceName);
                 }
             } catch (Throwable t) {
+                context = null;
                 supported = false;
                 unsupportedReason = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
                 Logger.info("Voxy Vulkan backend unavailable: " + unsupportedReason);
@@ -52,22 +47,24 @@ public final class VulkanBackend {
         return context;
     }
 
-    public static String statusLine() {
+    public static synchronized String statusLine() {
         if (supported == null) return "vk: unprobed";
-        return supported
-                ? ("vk: host(" + context.deviceName + "), images=" + VkImage2D.getCount()
-                + "/" + (VkImage2D.getTotalAllocationSize() >> 20) + "MiB")
-                : ("vk: unavailable (" + unsupportedReason + ")");
+        if (!supported || context == null) return "vk: unavailable (" + unsupportedReason + ")";
+        return "vk: host(" + context.deviceName + "), images=" + VkImage2D.getCount()
+                + "/" + (VkImage2D.getTotalAllocationSize() >> 20) + "MiB)";
     }
 
     public static synchronized void shutdown() {
-        //Host-adopted: do not destroy MC's device (VulkanContext.destroy handles this)
-        if (context != null) {
-            context.destroy();
-            context = null;
-        }
+        //Detach Java-visible state first. If a native cleanup call below fails,
+        //no later caller can reacquire a stale context pointing at a VkDevice
+        //Minecraft may already be in the process of closing.
+        VulkanContext oldContext = context;
+        context = null;
         supported = null;
         unsupportedReason = "not probed";
+        if (oldContext != null) {
+            oldContext.destroy();
+        }
     }
 
     private VulkanBackend() {}
