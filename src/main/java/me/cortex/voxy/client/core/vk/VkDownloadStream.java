@@ -29,6 +29,7 @@ public class VkDownloadStream extends AbstractDownloadStream {
     private long caddr = -1;
     private long offset = 0;
     private long recordFrame = -1;
+    private boolean closed;
 
     public VkDownloadStream(VkFrameCtx ctx, long size) {
         this.ctx = ctx;
@@ -58,6 +59,7 @@ public class VkDownloadStream extends AbstractDownloadStream {
 
     @Override
     public void download(IDeviceBuffer buffer, long downloadOffset, long size, DownloadResultConsumer resultConsumer) {
+        if (this.closed) throw new IllegalStateException("Vulkan download stream is closed");
         if (!(buffer instanceof VkBuffer vkBuffer)) throw new IllegalArgumentException("Vulkan download requires a VkBuffer source");
         if (resultConsumer == null) throw new IllegalArgumentException("Vulkan download requires a result consumer");
         if (size > Integer.MAX_VALUE || size <= 0) throw new IllegalArgumentException("Invalid Vulkan download size: " + size);
@@ -67,9 +69,10 @@ public class VkDownloadStream extends AbstractDownloadStream {
         if (this.caddr == -1 || !this.allocationArena.expand(this.caddr, (int) size)) {
             this.caddr = this.allocationArena.alloc((int) size);
             if (this.caddr == SIZE_LIMIT) {
-                throw new IllegalStateException("Vulkan readback staging exhausted ("
-                        + (this.readbackBuffer.size() >> 20) + " MiB, pendingFrames=" + this.frames.size()
-                        + "). Cannot safely force-reuse readback memory before Minecraft submits the current frame.");
+                //The current Minecraft frame may still only be recorded, not
+                //submitted. Device-idle cannot make that readback range safe to
+                //reuse, so fail instead of fabricating retirement.
+                throw new IllegalStateException("Vulkan readback staging exhausted before Minecraft submission retirement");
             }
             this.thisFrameAllocations.add(this.caddr);
             this.offset = size;
@@ -85,7 +88,7 @@ public class VkDownloadStream extends AbstractDownloadStream {
 
     @Override
     public void commit() {
-        if (this.downloadList.isEmpty()) return;
+        if (this.closed || this.downloadList.isEmpty()) return;
         this.recordFrame = this.ctx.currentFrame();
         var cmd = this.ctx.cmd();
         this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -108,6 +111,7 @@ public class VkDownloadStream extends AbstractDownloadStream {
 
     @Override
     public void tick() {
+        if (this.closed) return;
         this.commit();
         if (!this.thisFrameAllocations.isEmpty()) {
             this.frames.add(new DownloadFrame(this.recordFrame,
@@ -118,6 +122,7 @@ public class VkDownloadStream extends AbstractDownloadStream {
     }
 
     private void retireUpTo(long retiredFrame) {
+        if (this.closed) return;
         while (!this.frames.isEmpty() && this.frames.peek().frameIdx <= retiredFrame) {
             var frame = this.frames.pop();
             Throwable failure = null;
@@ -142,31 +147,51 @@ public class VkDownloadStream extends AbstractDownloadStream {
         }
     }
 
-    /** Discard CPU readback callbacks/bookkeeping without pretending GPU work completed. */
     @Override
     public void waitDiscard() {
-        this.frames.clear();
-        this.thisFrameAllocations.clear();
+        if (this.closed) return;
+        //Only safe as a synchronous operational helper when Minecraft has no
+        //host-retired frames outstanding. Normal renderer teardown uses free(),
+        //which discards CPU bookkeeping without reusing the staging buffer.
+        this.ctx.waitIdleRetireAll();
+        if (!this.frames.isEmpty() || this.ctx.inFlightFrameCount() != 0) {
+            throw new IllegalStateException("Cannot synchronously discard Vulkan readbacks before Minecraft submission retirement");
+        }
         this.downloadList.clear();
         this.thisFrameDownloadList.clear();
-        this.allocationArena.reset();
+        this.thisFrameAllocations.clear();
         this.caddr = -1;
         this.offset = 0;
         this.recordFrame = -1;
+        this.allocationArena.reset();
     }
 
-    /**
-     * Vulkan shutdown does not need stale visibility callbacks. Actual VkBuffer
-     * lifetime is protected independently by Minecraft's destruction queue.
-     */
     @Override
     public void flushWaitClear() {
-        this.waitDiscard();
+        if (this.closed) return;
+        this.tick();
+        this.ctx.waitIdleRetireAll();
+        if (!this.frames.isEmpty() || this.ctx.inFlightFrameCount() != 0) {
+            throw new IllegalStateException("Vulkan readbacks are still owned by Minecraft submissions");
+        }
     }
 
     @Override
     public void free() {
-        this.waitDiscard();
+        if (this.closed) return;
+        this.closed = true;
+        //Do not invoke pending readback callbacks during shutdown. Their GPU
+        //copies may belong to submissions that Minecraft has not retired yet.
+        //Dropping CPU bookkeeping is safe because the VkBuffer itself remains
+        //alive until Mojang's destruction queue says the submission completed.
+        this.downloadList.clear();
+        this.thisFrameDownloadList.clear();
+        this.thisFrameAllocations.clear();
+        this.frames.clear();
+        this.caddr = -1;
+        this.offset = 0;
+        this.recordFrame = -1;
+        this.allocationArena.reset();
         this.readbackBuffer.free();
     }
 
