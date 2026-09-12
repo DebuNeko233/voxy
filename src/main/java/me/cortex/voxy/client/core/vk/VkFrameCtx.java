@@ -231,15 +231,6 @@ public final class VkFrameCtx {
         }
     }
 
-    /** Raw-allocation compatibility path retained until every Vulkan image has moved to VMA. */
-    public void deferDestroy(long buffer, long memory) {
-        if (buffer == VK_NULL_HANDLE && memory == VK_NULL_HANDLE) return;
-        this.queueNativeDestroy(() -> {
-            if (buffer != VK_NULL_HANDLE) vkDestroyBuffer(this.ctx.device, buffer, null);
-            if (memory != VK_NULL_HANDLE) vkFreeMemory(this.ctx.device, memory, null);
-        });
-    }
-
     /** Destroy a buffer suballocated from Minecraft's VMA only after its submission retires. */
     public void deferDestroyVmaBuffer(long buffer, long allocation) {
         if (buffer == VK_NULL_HANDLE && allocation == VK_NULL_HANDLE) return;
@@ -268,15 +259,6 @@ public final class VkFrameCtx {
             }
             if (mainView != VK_NULL_HANDLE) vkDestroyImageView(this.ctx.device, mainView, null);
             Vma.vmaDestroyImage(this.ctx.vmaAllocator, image, allocation);
-        });
-    }
-
-    public void deferDestroyImage(long image, long view, long memory) {
-        if (image == VK_NULL_HANDLE && view == VK_NULL_HANDLE && memory == VK_NULL_HANDLE) return;
-        this.queueNativeDestroy(() -> {
-            if (view != VK_NULL_HANDLE) vkDestroyImageView(this.ctx.device, view, null);
-            if (image != VK_NULL_HANDLE) vkDestroyImage(this.ctx.device, image, null);
-            if (memory != VK_NULL_HANDLE) vkFreeMemory(this.ctx.device, memory, null);
         });
     }
 
