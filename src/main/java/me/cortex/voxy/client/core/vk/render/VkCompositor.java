@@ -50,7 +50,6 @@ public class VkCompositor {
     private int setupDepthFormat = -1;
     private int compositeColorFormat = -1, compositeDepthFormat = -1;
 
-    //Reused each frame for the composite-param matrices (no per-frame allocation)
     private final Matrix4f scratchA = new Matrix4f();
 
     public VkCompositor(VkFrameCtx ctx, VkUploadStream uploadStream, RenderProperties properties, boolean useEnvFog) {
@@ -97,7 +96,7 @@ public class VkCompositor {
         d.colorWrite = false;
         d.blend = false;
         d.stencilWriteAlways1 = true;
-        d.stencilWriteRef = 0;//mark vanilla-covered pixels with 0; LOD renders where stencil==1
+        d.stencilWriteRef = 0;
         d.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
         d.bindings = List.of(VkShaderPipeline.sampler(0));
 
@@ -136,13 +135,10 @@ public class VkCompositor {
         if (old != null) old.free();
     }
 
-    /** Wrapper carrying the per-frame MC attachment info alongside Voxy's viewport. */
     public record VkViewportRT(VkViewport viewport,
                                GpuTextureView mcColour, GpuTextureView mcDepth,
                                int mcWidth, int mcHeight) {}
 
-    //SETUP pass. MC's depth image is transitioned to shader-read for sampling
-    // and back to attachment afterwards.
     public void setupDepthStencil(VkViewportRT rt) {
         this.ensureSetupPipeline(rt);
         var cmd = this.ctx.cmd();
@@ -160,6 +156,8 @@ public class VkCompositor {
                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
         try (MemoryStack stack = stackPush()) {
+            //pColorAttachments takes a Buffer, while pDepthAttachment and
+            //pStencilAttachment take one VkRenderingAttachmentInfo struct.
             var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
                     .imageView(viewport.colour.view)
                     .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
@@ -172,7 +170,7 @@ public class VkCompositor {
                     .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             depthAttach.clearValue().depthStencil().depth(this.properties.clearDepth()).stencil(1);
-            var stencilAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+            var stencilAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(viewport.depthStencil.view)
                     .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
@@ -205,7 +203,6 @@ public class VkCompositor {
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     }
 
-    /** Transition Voxy's offscreen targets for sampling (HiZ build / composite). */
     public void offscreenToSampled(VkViewport viewport) {
         viewport.depthStencil.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -219,20 +216,18 @@ public class VkCompositor {
                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
     }
 
-    /** COMPOSITE pass into MC's frame attachments. */
     public void composite(VkViewportRT rt) {
         var viewport = rt.viewport;
         boolean fogCoversAllRendering = viewport.fogParameters != null
                 && viewport.fogParameters.environmentalEnd() < VoxyRenderSystem.getVanillaRenderDistance();
-        if (fogCoversAllRendering) {
-            return;//mirrors the GL "fog covers everything -> skip blit" branch
-        }
+        if (fogCoversAllRendering) return;
+
         int mcColorFormat = VkFrameHost.vkFormat(rt.mcColour);
         int mcDepthFormat = VkFrameHost.vkFormat(rt.mcDepth);
         this.ensureCompositePipeline(mcColorFormat, mcDepthFormat);
         var cmd = this.ctx.cmd();
 
-        {//composite params UBO
+        {
             long ptr = this.uploadStream.upload(this.compositeParams, 0, 256);
             this.scratchA.set(viewport.MVP).invert().getToAddress(ptr); ptr += 64;
             this.scratchA.set(viewport.vanillaProjection).mul(viewport.modelView).getToAddress(ptr); ptr += 64;
@@ -275,7 +270,7 @@ public class VkCompositor {
                     .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            var depthAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+            var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(VkFrameHost.vkView(rt.mcDepth))
                     .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
@@ -302,9 +297,6 @@ public class VkCompositor {
     public void free() {
         if (this.depthSetup != null) this.depthSetup.free();
         if (this.composite != null) this.composite.free();
-        //depthSampler/colourSampler come from VkImage2D.createSampler's
-        // device-lifetime cache (shared across compositor/SSAO/terrain); never
-        // destroy them per-object (double vkDestroySampler -> SIGSEGV on unload)
         this.compositeParams.free();
     }
 }
