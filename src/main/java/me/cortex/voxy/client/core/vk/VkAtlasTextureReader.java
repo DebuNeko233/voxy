@@ -12,16 +12,7 @@ import org.lwjgl.vulkan.VkImageMemoryBarrier;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
-//Vulkan block-atlas readback: copies MC's stitched atlas image (mip 0) into a
-// host-visible staging buffer via vkCmdCopyImageToBuffer and reads it into an
-// int[] in the same RGBA8 byte order (R,G,B,A) the GL path produced. The atlas
-// is VK_FORMAT_R8G8B8A8_UNORM, so the raw texel bytes match GL RGBA/UNSIGNED_BYTE
-// one-for-one and the software rasterizer sees identical data.
-//
-//Runs once at model-bakery construction, outside any frame, through the frame
-// ctx's immediate command buffer (submitted + waited synchronously). Assumes
-// MC creates the atlas with TRANSFER_SRC usage and keeps it in
-// SHADER_READ_ONLY_OPTIMAL between frames (validation layers flag both).
+//Synchronous Vulkan block-atlas readback used during model-bakery creation.
 public final class VkAtlasTextureReader extends IAtlasTextureReader {
     private final VkFrameCtx frameCtx;
 
@@ -36,19 +27,22 @@ public final class VkAtlasTextureReader extends IAtlasTextureReader {
         var staging = new VkBuffer(this.frameCtx, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
         try {
             var cmd = this.frameCtx.cmd();
-            //MC keeps the sampled atlas in SHADER_READ_ONLY_OPTIMAL; move mip 0 to
-            // TRANSFER_SRC for the copy, then restore it so MC's sampling is unaffected.
             transition(cmd, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            try (MemoryStack stack = stackPush()) {
-                var region = VkBufferImageCopy.calloc(1, stack)
-                        .bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
-                region.imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
-                        .mipLevel(0).baseArrayLayer(0).layerCount(1);
-                region.imageOffset().set(0, 0, 0);
-                region.imageExtent().set(width, height, 1);
-                vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.buffer, region);
+            try {
+                try (MemoryStack stack = stackPush()) {
+                    var region = VkBufferImageCopy.calloc(1, stack)
+                            .bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+                    region.imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                            .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                    region.imageOffset().set(0, 0, 0);
+                    region.imageExtent().set(width, height, 1);
+                    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.buffer, region);
+                }
+            } finally {
+                //Even a Java-side failure while preparing the copy must not leave
+                // Minecraft's atlas recorded in TRANSFER_SRC layout.
+                transition(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
-            transition(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             this.frameCtx.flushImmediate();
 
             var out = new int[width * height];
@@ -56,8 +50,11 @@ public final class VkAtlasTextureReader extends IAtlasTextureReader {
             MemoryUtil.memIntBuffer(ptr, out.length).get(out);
             return out;
         } finally {
-            //Deferred destroy; vkFreeMemory implicitly unmaps the staging map above.
             staging.free();
+            //This staging allocation is one-shot and can be large. The atlas copy
+            // is synchronous, so retire it immediately rather than carrying it
+            // until the first rendered frame happens to advance the retire queue.
+            this.frameCtx.waitIdleRetireAll();
         }
     }
 
