@@ -14,9 +14,52 @@ layout(local_size_x = 128) in;
 #import <voxy:lod/section.glsl>
 #import <voxy:lod/gl46/bindings.glsl>
 
-//https://github.com/KhronosGroup/GLSL/blob/master/extensions/ext/GL_EXT_shader_16bit_storage.txt
-// adds support for uint8_t which can use for compact visibility buffer
+#ifndef OPAQUE_DRAW_CAP
+#define OPAQUE_DRAW_CAP 400000u
+#endif
+#ifndef TRANSLUCENT_DRAW_CAP
+#define TRANSLUCENT_DRAW_CAP 100000u
+#endif
+#ifndef TEMPORAL_DRAW_CAP
+#define TEMPORAL_DRAW_CAP 100000u
+#endif
 
+//The adopted Minecraft 26.2 Vulkan device does not enable drawIndirectCount,
+//so Voxy also has to be robust when a sudden visibility jump would generate
+//more commands than a fixed indirect buffer can hold. Saturating the counters
+//prevents the command-generation compute pass itself from writing out of bounds.
+uint reserveOpaque(uint amount) {
+    uint observed = opaqueDrawCount;
+    for (;;) {
+        if (observed >= OPAQUE_DRAW_CAP) return OPAQUE_DRAW_CAP;
+        uint next = min(OPAQUE_DRAW_CAP, observed + amount);
+        uint previous = atomicCompSwap(opaqueDrawCount, observed, next);
+        if (previous == observed) return observed;
+        observed = previous;
+    }
+}
+
+uint reserveTemporal(uint amount) {
+    uint observed = temporalOpaqueDrawCount;
+    for (;;) {
+        if (observed >= TEMPORAL_DRAW_CAP) return TEMPORAL_DRAW_CAP;
+        uint next = min(TEMPORAL_DRAW_CAP, observed + amount);
+        uint previous = atomicCompSwap(temporalOpaqueDrawCount, observed, next);
+        if (previous == observed) return observed;
+        observed = previous;
+    }
+}
+
+uint reserveTranslucent() {
+    uint observed = translucentDrawCount;
+    for (;;) {
+        if (observed >= TRANSLUCENT_DRAW_CAP) return TRANSLUCENT_DRAW_CAP;
+        uint next = observed + 1u;
+        uint previous = atomicCompSwap(translucentDrawCount, observed, next);
+        if (previous == observed) return observed;
+        observed = previous;
+    }
+}
 
 #ifdef HAS_STATISTICS
 layout(binding = STATISTICS_BUFFER_BINDING, std430) restrict buffer statisticsBuffer {
@@ -94,11 +137,11 @@ void main() {
 
 
         uint cmdCnt = bitCount(msk);
-        uint cmdPtr = atomicAdd(opaqueDrawCount, cmdCnt);
+        uint cmdPtr = reserveOpaque(cmdCnt);
 
-        uint tCmdPtr = 0;
+        uint tCmdPtr = TEMPORAL_DRAW_CAP + TEMPORAL_OFFSET;
         if (renderTemporally) {
-            tCmdPtr = atomicAdd(temporalOpaqueDrawCount, cmdCnt) + TEMPORAL_OFFSET;
+            tCmdPtr = reserveTemporal(cmdCnt) + TEMPORAL_OFFSET;
         }
 
         //TODO: make totalQuads also have temporal amount
@@ -110,13 +153,15 @@ void main() {
         //Translucency
         count = counts.x&0xFFFFu;
         if (count != 0) {
-            uint tp = atomicAdd(translucentDrawCount, 1)+TRANSLUCENT_WRITE_BASE;
-            translucentCommandData[tp] = drawId;
-            uvec3 absRel = abs(relative);
-            uint distToCamera = (absRel.x+absRel.y+absRel.z)<<detail;
-            //The -1 is because we want 0 to TRANSLUCENT_WRITE_BASE, exclusive of ending, not inclusive (0->1023)
-            distToCamera = (TRANSLUCENT_WRITE_BASE-1)-min(distToCamera, (TRANSLUCENT_WRITE_BASE-1));
-            atomicAdd(translucentCommandData[distToCamera], 1);
+            uint tp = reserveTranslucent();
+            if (tp < TRANSLUCENT_DRAW_CAP) {
+                translucentCommandData[tp+TRANSLUCENT_WRITE_BASE] = drawId;
+                uvec3 absRel = abs(relative);
+                uint distToCamera = (absRel.x+absRel.y+absRel.z)<<detail;
+                //The -1 is because we want 0 to TRANSLUCENT_WRITE_BASE, exclusive of ending, not inclusive (0->1023)
+                distToCamera = (TRANSLUCENT_WRITE_BASE-1)-min(distToCamera, (TRANSLUCENT_WRITE_BASE-1));
+                atomicAdd(translucentCommandData[distToCamera], 1);
+            }
             #ifdef HAS_STATISTICS
             totalQuads += count;
             #endif
@@ -126,8 +171,8 @@ void main() {
         //Double sided quads
         count = (counts.x>>16)&0xFFFFu;
         if (count != 0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
-            if (renderTemporally) {
+            if (cmdPtr < OPAQUE_DRAW_CAP) writeCmd(cmdPtr++, drawId, ptr, count);
+            if (renderTemporally && tCmdPtr < TEMPORAL_OFFSET + TEMPORAL_DRAW_CAP) {
                 writeCmd(tCmdPtr++, drawId, ptr, count);
             }
             #ifdef HAS_STATISTICS
@@ -139,8 +184,8 @@ void main() {
         //Down
         count = (counts.y)&0xFFFFu;
         if (((msk&(1u<<0))!=0)) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
-            if (renderTemporally) {
+            if (cmdPtr < OPAQUE_DRAW_CAP) writeCmd(cmdPtr++, drawId, ptr, count);
+            if (renderTemporally && tCmdPtr < TEMPORAL_OFFSET + TEMPORAL_DRAW_CAP) {
                 writeCmd(tCmdPtr++, drawId, ptr, count);
             }
             #ifdef HAS_STATISTICS
@@ -152,8 +197,8 @@ void main() {
         //Up
         count = (counts.y>>16)&0xFFFFu;
         if ((msk&(1u<<1))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
-            if (renderTemporally) {
+            if (cmdPtr < OPAQUE_DRAW_CAP) writeCmd(cmdPtr++, drawId, ptr, count);
+            if (renderTemporally && tCmdPtr < TEMPORAL_OFFSET + TEMPORAL_DRAW_CAP) {
                 writeCmd(tCmdPtr++, drawId, ptr, count);
             }
             #ifdef HAS_STATISTICS
@@ -165,8 +210,8 @@ void main() {
         //North
         count = (counts.z)&0xFFFFu;
         if ((msk&(1u<<2))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
-            if (renderTemporally) {
+            if (cmdPtr < OPAQUE_DRAW_CAP) writeCmd(cmdPtr++, drawId, ptr, count);
+            if (renderTemporally && tCmdPtr < TEMPORAL_OFFSET + TEMPORAL_DRAW_CAP) {
                 writeCmd(tCmdPtr++, drawId, ptr, count);
             }
             #ifdef HAS_STATISTICS
@@ -178,8 +223,8 @@ void main() {
         //South
         count = (counts.z>>16)&0xFFFFu;
         if ((msk&(1u<<3))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
-            if (renderTemporally) {
+            if (cmdPtr < OPAQUE_DRAW_CAP) writeCmd(cmdPtr++, drawId, ptr, count);
+            if (renderTemporally && tCmdPtr < TEMPORAL_OFFSET + TEMPORAL_DRAW_CAP) {
                 writeCmd(tCmdPtr++, drawId, ptr, count);
             }
             #ifdef HAS_STATISTICS
@@ -191,8 +236,8 @@ void main() {
         //West
         count = (counts.w)&0xFFFFu;
         if ((msk&(1u<<4))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
-            if (renderTemporally) {
+            if (cmdPtr < OPAQUE_DRAW_CAP) writeCmd(cmdPtr++, drawId, ptr, count);
+            if (renderTemporally && tCmdPtr < TEMPORAL_OFFSET + TEMPORAL_DRAW_CAP) {
                 writeCmd(tCmdPtr++, drawId, ptr, count);
             }
             #ifdef HAS_STATISTICS
@@ -204,8 +249,8 @@ void main() {
         //East
         count = (counts.w>>16)&0xFFFFu;
         if ((msk&(1u<<5))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
-            if (renderTemporally) {
+            if (cmdPtr < OPAQUE_DRAW_CAP) writeCmd(cmdPtr++, drawId, ptr, count);
+            if (renderTemporally && tCmdPtr < TEMPORAL_OFFSET + TEMPORAL_DRAW_CAP) {
                 writeCmd(tCmdPtr++, drawId, ptr, count);
             }
             #ifdef HAS_STATISTICS
