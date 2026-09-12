@@ -17,8 +17,19 @@ public interface IVkHost {
     VkQueue graphicsQueue();
     int graphicsQueueFamily();
 
-    /** Command buffer currently recording for this frame at Voxy's injection point. */
+    /**
+     * Minecraft's primary graphics command buffer for the current submission.
+     * The host ensures one exists when Voxy asks at a safe, render-pass-free
+     * integration point.
+     */
     VkCommandBuffer frameCommandBuffer();
+
+    /**
+     * Submit Minecraft's current Vulkan encoder batch and synchronously wait for
+     * that exact timeline-semaphore submit to complete. This is used only for
+     * construction/readback work that truly needs CPU-visible completion.
+     */
+    void submitAndWaitCurrent();
 
     /**
      * Run {@code action} only after the Minecraft Vulkan submission associated
