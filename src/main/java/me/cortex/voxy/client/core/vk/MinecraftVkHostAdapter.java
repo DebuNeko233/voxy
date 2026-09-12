@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.vk;
 
 import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import me.cortex.voxy.client.mixin.vk.AccessorVulkanCommandEncoder;
 import me.cortex.voxy.client.mixin.vk.AccessorVulkanDevice;
@@ -19,7 +20,7 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         this.device = device;
     }
 
-    private com.mojang.blaze3d.vulkan.VulkanCommandEncoder encoder() {
+    private VulkanCommandEncoder encoder() {
         return ((AccessorVulkanDevice) (Object) this.device).voxy$commandEncoder();
     }
 
@@ -71,5 +72,17 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         //has completed. That is the Vulkan-valid lifetime boundary for Voxy's
         //buffers/images/pipelines and CPU staging bookkeeping.
         this.encoder().queueForDestroy(action::run);
+    }
+
+    @Override
+    public void drainDeferredDestruction() {
+        RenderSystem.assertOnRenderThread();
+        //Minecraft rotates one destruction slot per submit and exposes the exact
+        //number of potentially in-flight submissions. Advance through every slot
+        //using the host's normal timeline-fenced submission path; never invoke or
+        //reflect into the private destruction queue directly.
+        for (int i = 0; i < VulkanCommandEncoder.MAX_SUBMITS_IN_FLIGHT; i++) {
+            this.submitAndWaitCurrent();
+        }
     }
 }
