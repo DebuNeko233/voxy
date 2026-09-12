@@ -34,7 +34,10 @@ if not exist "gradlew.bat" (
 )
 
 echo [1/3] Building Voxy with Gradle...
-call gradlew.bat clean build -PincludeOtherArchs=true --stacktrace
+rem Build the installable mod for the current platform. Do not force
+rem includeOtherArchs here: that option is for dedicated universal/release
+rem packaging and can make Loom resolve foreign Minecraft runtime natives.
+call gradlew.bat clean build --stacktrace
 if errorlevel 1 goto :gradle_failed
 
 echo [2/3] Locating the remapped mod JAR...
@@ -68,7 +71,7 @@ exit /b 0
 
 :gradle_failed
 echo.
-echo [ERROR] Gradle build failed. Check the error above. JDK 25 or newer is required.
+echo [ERROR] Gradle build failed. Java 25+ was already verified; check the dependency/build error above.
 :failed
 echo.
 pause
