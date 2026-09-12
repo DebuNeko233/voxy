@@ -51,8 +51,10 @@ public class VkDownloadStream extends AbstractDownloadStream {
 
     @Override
     public void download(IDeviceBuffer buffer, long downloadOffset, long size, DownloadResultConsumer resultConsumer) {
-        if (size > Integer.MAX_VALUE || size <= 0) throw new IllegalArgumentException();
-        if (downloadOffset + size > buffer.sizeBytes()) throw new IllegalArgumentException();
+        if (!(buffer instanceof VkBuffer vkBuffer)) throw new IllegalArgumentException("Vulkan download requires a VkBuffer source");
+        if (resultConsumer == null) throw new IllegalArgumentException("Vulkan download requires a result consumer");
+        if (size > Integer.MAX_VALUE || size <= 0) throw new IllegalArgumentException("Invalid Vulkan download size: " + size);
+        if (downloadOffset < 0 || downloadOffset > buffer.sizeBytes() - size) throw new IllegalArgumentException("Vulkan download exceeds source buffer");
 
         long addr;
         if (this.caddr == -1 || !this.allocationArena.expand(this.caddr, (int) size)) {
@@ -77,7 +79,8 @@ public class VkDownloadStream extends AbstractDownloadStream {
             addr = this.caddr + this.offset;
             this.offset += size;
         }
-        this.downloadList.add(new DownloadData((VkBuffer) buffer, addr, downloadOffset, size, resultConsumer));
+        if (this.caddr + this.offset > this.readbackBuffer.size()) throw new IllegalStateException("Vulkan readback staging allocation exceeded buffer");
+        this.downloadList.add(new DownloadData(vkBuffer, addr, downloadOffset, size, resultConsumer));
         this.commit();
     }
 
@@ -118,10 +121,23 @@ public class VkDownloadStream extends AbstractDownloadStream {
     private void retireUpTo(long retiredFrame) {
         while (!this.frames.isEmpty() && this.frames.peek().frameIdx <= retiredFrame) {
             var frame = this.frames.pop();
+            Throwable failure = null;
             for (var data : frame.data) {
-                data.resultConsumer.consume(this.readbackPtr + data.downloadStreamOffset, data.size);
+                try {
+                    data.resultConsumer.consume(this.readbackPtr + data.downloadStreamOffset, data.size);
+                } catch (RuntimeException | Error callbackFailure) {
+                    if (failure == null) failure = callbackFailure;
+                    else failure.addSuppressed(callbackFailure);
+                }
             }
-            frame.allocations.forEach(this.allocationArena::free);
+            try {
+                frame.allocations.forEach(this.allocationArena::free);
+            } catch (RuntimeException | Error releaseFailure) {
+                if (failure == null) failure = releaseFailure;
+                else failure.addSuppressed(releaseFailure);
+            }
+            if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (failure instanceof Error errorFailure) throw errorFailure;
         }
     }
 
