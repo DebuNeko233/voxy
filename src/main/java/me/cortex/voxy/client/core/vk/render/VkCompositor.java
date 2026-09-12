@@ -25,16 +25,16 @@ import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdEndRenderingKHR;
 import static org.lwjgl.vulkan.VK10.*;
 
 //The two fullscreen passes bracketing Voxy's VK frame, mirroring the GL
-// NormalRenderPipeline:
+//NormalRenderPipeline:
 //
-//  SETUP  — clear Voxy's offscreen depth-stencil (depth=clear, stencil=1) and
-//           colour, then copy MC's depth in (transformed into Voxy's projection
-//           space by the fragment shader) writing stencil=0 where vanilla
-//           terrain exists. LOD terrain then renders with stencil==1 only.
+// SETUP — clear Voxy's offscreen depth-stencil (depth=clear, stencil=1) and
+// colour, then copy MC's depth in (transformed into Voxy's projection space by
+// the fragment shader) writing stencil=0 where vanilla terrain exists. LOD
+// terrain then renders with stencil==1 only.
 //
-//  COMPOSITE — alpha-blend Voxy's offscreen colour into MC's frame, emitting
-//           depth transformed back into vanilla's projection space, with the
-//           environmental fog ramp applied.
+// COMPOSITE — alpha-blend Voxy's offscreen colour into MC's frame, emitting
+// depth transformed back into vanilla's projection space, with environmental
+// fog applied.
 public class VkCompositor {
     private final VkFrameCtx ctx;
     private final VkUploadStream uploadStream;
@@ -314,10 +314,12 @@ public class VkCompositor {
         } finally {
             if (rendering) {
                 vkCmdEndRenderingKHR(cmd);
-                //Make Voxy's colour/depth writes visible to the Minecraft passes
-                //that continue after the Sodium opaque-layer hook.
-                VkFrameHost.barrierMcImageForAttachment(cmd, rt.mcColour, false);
-                VkFrameHost.barrierMcImageForAttachment(cmd, rt.mcDepth, true);
+                //Voxy is now handing Minecraft-owned targets back to Blaze3D.
+                //The next user may be another attachment pass, a sampler, a
+                //transfer, or post-processing. Publish our writes broadly while
+                //preserving the GENERAL layout Minecraft tracks internally.
+                VkFrameHost.barrierMcImageForExternalUse(cmd, rt.mcColour, false);
+                VkFrameHost.barrierMcImageForExternalUse(cmd, rt.mcDepth, true);
             }
         }
     }
