@@ -7,6 +7,7 @@ import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTra
 import me.cortex.voxy.client.core.vk.VkBuffer;
 import me.cortex.voxy.client.core.vk.VkFrameCtx;
 import me.cortex.voxy.client.core.vk.VkImage2D;
+import me.cortex.voxy.client.core.vk.VkUtil;
 import me.cortex.voxy.common.Logger;
 
 import static org.lwjgl.vulkan.VK10.*;
@@ -92,6 +93,25 @@ public class VkViewport extends Viewport<VkViewport> {
         if (image != null) image.freeUnsubmittedNow();
     }
 
+    private void restorePreviousTargetsAfterOom(int requestedWidth, int requestedHeight, RuntimeException failure) {
+        this.failedResizeWidth = requestedWidth;
+        this.failedResizeHeight = requestedHeight;
+        this.resizeRetryAfterFrame = this.frameId + RESIZE_RETRY_FRAMES;
+        this.width = this.colour.width;
+        this.height = this.colour.height;
+        try {
+            var budget = this.ctx.vk().deviceLocalBudget();
+            Logger.warn("Voxy VK: keeping previous " + this.width + "x" + this.height
+                    + " targets after " + requestedWidth + "x" + requestedHeight
+                    + " resize ran out of Vulkan memory; free="
+                    + (budget.availableBytes() >> 20) + " MiB, retrying later ("
+                    + failure.getMessage() + ")");
+        } catch (RuntimeException ignored) {
+            Logger.warn("Voxy VK: keeping previous framebuffer size after resize OOM: "
+                    + failure.getMessage());
+        }
+    }
+
     /** (Re)creates the offscreen targets on size change; true if recreated. */
     public boolean ensureTargets() {
         if (this.width <= 0 || this.height <= 0) return false;
@@ -143,31 +163,22 @@ public class VkViewport extends Viewport<VkViewport> {
                     VK_FORMAT_D32_SFLOAT,
                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     VK_IMAGE_ASPECT_DEPTH_BIT, false);
-        } catch (RuntimeException failure) {
+        } catch (VkUtil.VulkanCallException failure) {
             freeUnsubmitted(newDepthBound);
             freeUnsubmitted(newDepthStencil);
             freeUnsubmitted(newColourSSAO);
             freeUnsubmitted(newColour);
 
-            if (this.colour != null) {
-                this.failedResizeWidth = requestedWidth;
-                this.failedResizeHeight = requestedHeight;
-                this.resizeRetryAfterFrame = this.frameId + RESIZE_RETRY_FRAMES;
-                this.width = this.colour.width;
-                this.height = this.colour.height;
-                try {
-                    var budget = this.ctx.vk().deviceLocalBudget();
-                    Logger.warn("Voxy VK: keeping previous " + this.width + "x" + this.height
-                            + " targets after " + requestedWidth + "x" + requestedHeight
-                            + " resize exceeded/failed VMA allocation; free="
-                            + (budget.availableBytes() >> 20) + " MiB, retrying later ("
-                            + failure.getMessage() + ")");
-                } catch (RuntimeException ignored) {
-                    Logger.warn("Voxy VK: keeping previous framebuffer size after resize allocation failed: "
-                            + failure.getMessage());
-                }
+            if (failure.isOutOfMemory() && this.colour != null) {
+                this.restorePreviousTargetsAfterOom(requestedWidth, requestedHeight, failure);
                 return false;
             }
+            throw failure;
+        } catch (RuntimeException failure) {
+            freeUnsubmitted(newDepthBound);
+            freeUnsubmitted(newDepthStencil);
+            freeUnsubmitted(newColourSSAO);
+            freeUnsubmitted(newColour);
             throw failure;
         } catch (Error failure) {
             freeUnsubmitted(newDepthBound);
