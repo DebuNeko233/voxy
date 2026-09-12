@@ -16,12 +16,12 @@ import org.lwjgl.vulkan.VkQueue;
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
-import static org.lwjgl.vulkan.VK11.*;
 
 //Wraps Minecraft's already-created Vulkan device. Voxy never creates or
 // reconfigures the logical device, so optional features are usable only when
 // Minecraft itself is known to have enabled them.
 public final class VulkanContext {
+    private final IVkHost host;
     public final VkInstance instance;
     public final VkPhysicalDevice physicalDevice;
     public final VkDevice device;
@@ -43,19 +43,16 @@ public final class VulkanContext {
     public static VulkanContext adopt(IVkHost host) { return new VulkanContext(host); }
 
     private VulkanContext(IVkHost host) {
+        this.host = host;
         this.instance = host.instance();
         this.physicalDevice = host.physicalDevice();
         this.device = host.device();
         this.queue = host.graphicsQueue();
         this.queueFamily = host.graphicsQueueFamily();
 
-        //Important: vkGetPhysicalDeviceFeatures2 reports what the PHYSICAL device
-        // supports, not which optional features Minecraft enabled when creating
-        // this adopted VkDevice. Vulkan requires drawIndirectCount to be enabled
-        // in VkDeviceCreateInfo before vkCmdDraw*IndirectCount can be used. MC
-        // 26.2 exposes no enabled-feature bit for drawIndirectCount, so the only
-        // correct default is the fixed-count fallback. This can be promoted to a
-        // fast path later if Blaze3D exposes a reliable enabled-feature signal.
+        //Physical-device support is not proof that Minecraft enabled this
+        // optional feature on the adopted logical device, so stay on the
+        // fixed-count compatibility path until Blaze3D exposes that fact.
         this.hasDrawIndirectCount = false;
 
         var subgroup = querySubgroupProperties(this.physicalDevice);
@@ -121,6 +118,15 @@ public final class VulkanContext {
                 + ", subgroupArithmetic=" + this.subgroupArithmetic
                 + " (deviceCapable=" + deviceSupportsSubgroups + ", gate=" + ENABLE_SUBGROUP_PATHS + ")"
                 + ", subgroupSize=" + this.subgroupSize + ")");
+    }
+
+    /**
+     * Uses Minecraft 26.2's own timeline-semaphore-backed DestructionQueue.
+     * The action therefore runs only after the associated graphics submission
+     * has completed, satisfying Vulkan object-lifetime rules.
+     */
+    public void deferUntilSubmissionComplete(Runnable action) {
+        this.host.deferUntilSubmissionComplete(action);
     }
 
     private static VkPhysicalDeviceSubgroupProperties querySubgroupProperties(VkPhysicalDevice pd) {
