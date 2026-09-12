@@ -45,40 +45,65 @@ public class VkNodeCleaner implements INodeCleaner {
         this.uploadStream = up;
         this.downloadStream = down;
         this.nodeManager = nodeManager;
-        this.visibilityBuffer = new VkBuffer(ctx, nodeManager.maxNodeCount * 4L).fill(-1);
-        this.outputBuffer = new VkBuffer(ctx, OUTPUT_COUNT * 4 + OUTPUT_COUNT * 8);
-        ctx.flushImmediate();
 
-        this.sorter = new VkShaderPipeline(ctx, "sort_visibility_vk.comp",
-                VkShaderSource.load("voxy:lod/hierarchical/cleaner/sort_visibility_vk.comp", VkShaderSource.defs()
-                        .def("WORK_SIZE", SORTING_WORKER_SIZE)
-                        .def("ELEMS_PER_THREAD", WORK_PER_THREAD)
-                        .def("OUTPUT_SIZE", OUTPUT_COUNT)
-                        .def("VISIBILITY_BUFFER_BINDING", 1)
-                        .def("OUTPUT_BUFFER_BINDING", 2)
-                        .def("NODE_DATA_BINDING", 3)
-                        .build()),
-                0,
-                List.of(VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(2), VkShaderPipeline.ssbo(3)));
+        VkBuffer visibility = null;
+        VkBuffer output = null;
+        VkShaderPipeline sorterPipeline = null;
+        VkShaderPipeline transformerPipeline = null;
+        VkShaderPipeline clearPipeline = null;
+        try {
+            visibility = new VkBuffer(ctx, nodeManager.maxNodeCount * 4L).fill(-1);
+            output = new VkBuffer(ctx, OUTPUT_COUNT * 4 + OUTPUT_COUNT * 8);
+            ctx.flushImmediate();
 
-        this.resultTransformer = new VkShaderPipeline(ctx, "result_transformer.comp",
-                VkShaderSource.load("voxy:lod/hierarchical/cleaner/result_transformer.comp", VkShaderSource.defs()
-                        .def("OUTPUT_SIZE", OUTPUT_COUNT)
-                        .def("MIN_ID_BUFFER_BINDING", 0)
-                        .def("NODE_BUFFER_BINDING", 1)
-                        .def("OUTPUT_BUFFER_BINDING", 2)
-                        .def("VISIBILITY_BUFFER_BINDING", 3)
-                        .build()),
-                4,
-                List.of(VkShaderPipeline.ssbo(0), VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(2), VkShaderPipeline.ssbo(3)));
+            sorterPipeline = new VkShaderPipeline(ctx, "sort_visibility_vk.comp",
+                    VkShaderSource.load("voxy:lod/hierarchical/cleaner/sort_visibility_vk.comp", VkShaderSource.defs()
+                            .def("WORK_SIZE", SORTING_WORKER_SIZE)
+                            .def("ELEMS_PER_THREAD", WORK_PER_THREAD)
+                            .def("OUTPUT_SIZE", OUTPUT_COUNT)
+                            .def("VISIBILITY_BUFFER_BINDING", 1)
+                            .def("OUTPUT_BUFFER_BINDING", 2)
+                            .def("NODE_DATA_BINDING", 3)
+                            .build()),
+                    0,
+                    List.of(VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(2), VkShaderPipeline.ssbo(3)));
 
-        this.batchClear = new VkShaderPipeline(ctx, "batch_visibility_set.comp",
-                VkShaderSource.load("voxy:lod/hierarchical/cleaner/batch_visibility_set.comp", VkShaderSource.defs()
-                        .def("VISIBILITY_BUFFER_BINDING", 0)
-                        .def("LIST_BUFFER_BINDING", 1)
-                        .build()),
-                8,
-                List.of(VkShaderPipeline.ssbo(0), VkShaderPipeline.ssbo(1)));
+            transformerPipeline = new VkShaderPipeline(ctx, "result_transformer.comp",
+                    VkShaderSource.load("voxy:lod/hierarchical/cleaner/result_transformer.comp", VkShaderSource.defs()
+                            .def("OUTPUT_SIZE", OUTPUT_COUNT)
+                            .def("MIN_ID_BUFFER_BINDING", 0)
+                            .def("NODE_BUFFER_BINDING", 1)
+                            .def("OUTPUT_BUFFER_BINDING", 2)
+                            .def("VISIBILITY_BUFFER_BINDING", 3)
+                            .build()),
+                    4,
+                    List.of(VkShaderPipeline.ssbo(0), VkShaderPipeline.ssbo(1), VkShaderPipeline.ssbo(2), VkShaderPipeline.ssbo(3)));
+
+            clearPipeline = new VkShaderPipeline(ctx, "batch_visibility_set.comp",
+                    VkShaderSource.load("voxy:lod/hierarchical/cleaner/batch_visibility_set.comp", VkShaderSource.defs()
+                            .def("VISIBILITY_BUFFER_BINDING", 0)
+                            .def("LIST_BUFFER_BINDING", 1)
+                            .build()),
+                    8,
+                    List.of(VkShaderPipeline.ssbo(0), VkShaderPipeline.ssbo(1)));
+        } catch (RuntimeException | Error failure) {
+            if (clearPipeline != null) clearPipeline.free();
+            if (transformerPipeline != null) transformerPipeline.free();
+            if (sorterPipeline != null) sorterPipeline.free();
+            if (output != null) output.free();
+            if (visibility != null) visibility.free();
+            //The buffer initialisation fills were submitted synchronously above;
+            // retire deferred destroys now so a failed renderer construction does
+            // not leave cleaner allocations resident until some future frame.
+            ctx.waitIdleRetireAll();
+            throw failure;
+        }
+
+        this.visibilityBuffer = visibility;
+        this.outputBuffer = output;
+        this.sorter = sorterPipeline;
+        this.resultTransformer = transformerPipeline;
+        this.batchClear = clearPipeline;
     }
 
     @Override
