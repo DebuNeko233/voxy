@@ -10,13 +10,13 @@ import org.lwjgl.vulkan.VkMemoryRequirements;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
-import static org.lwjgl.system.MemoryUtil.NULL;
 import static org.lwjgl.vulkan.VK10.*;
 
 //Device buffer on the pure-Vulkan path; the VK analogue of GlBuffer. All Voxy
 // buffers get a superset of usage flags (storage/indirect/index/transfer) so a
 // single class covers every role the GL path used raw buffer ids for. Memory is
-// a dedicated device-local allocation (Voxy has few, large, long-lived buffers).
+// currently a dedicated device-local allocation (Voxy has few, large,
+// long-lived buffers).
 //
 //Freeing is DEFERRED through VkFrameCtx — a buffer may still be referenced by
 // command buffers in flight when free() is called.
@@ -32,9 +32,11 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
     public final long buffer;
     public final long memory;
     private final long size;
+    private final long allocationSize;
 
     private static int COUNT;
     private static long TOTAL_SIZE;
+    private static long TOTAL_ALLOCATION_SIZE;
 
     public VkBuffer(VkFrameCtx ctx, long size) {
         this(ctx, size, USAGE_DEFAULT, false);
@@ -44,28 +46,52 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
         this.ctx = ctx;
         this.size = size;
         var vctx = ctx.vk();
+
+        long createdBuffer = VK_NULL_HANDLE;
+        long allocatedMemory = VK_NULL_HANDLE;
+        long allocatedBytes = 0;
         try (MemoryStack stack = stackPush()) {
             var bci = VkBufferCreateInfo.calloc(stack).sType$Default()
                     .size(size).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE);
             var pBuf = stack.mallocLong(1);
             check(vkCreateBuffer(vctx.device, bci, null, pBuf), "vkCreateBuffer");
-            this.buffer = pBuf.get(0);
+            createdBuffer = pBuf.get(0);
 
             var req = VkMemoryRequirements.calloc(stack);
-            vkGetBufferMemoryRequirements(vctx.device, this.buffer, req);
+            vkGetBufferMemoryRequirements(vctx.device, createdBuffer, req);
+            allocatedBytes = req.size();
             int props = hostVisible
                     ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                     : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
             var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
-                    .allocationSize(req.size())
+                    .allocationSize(allocatedBytes)
                     .memoryTypeIndex(vctx.findMemoryType(req.memoryTypeBits(), props));
             var pMem = stack.mallocLong(1);
             check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory");
-            this.memory = pMem.get(0);
-            check(vkBindBufferMemory(vctx.device, this.buffer, this.memory, 0), "vkBindBufferMemory");
+            allocatedMemory = pMem.get(0);
+            check(vkBindBufferMemory(vctx.device, createdBuffer, allocatedMemory, 0), "vkBindBufferMemory");
+        } catch (RuntimeException | Error failure) {
+            //VkSectionGeometryData deliberately retries with a smaller allocation
+            //when a large device-local buffer cannot be allocated. A failed
+            //constructor must therefore be transactional: otherwise every retry
+            //leaves the already-created VkBuffer (or VkDeviceMemory after a bind
+            //failure) alive and turns a recoverable OOM into persistent VRAM
+            //pressure.
+            if (allocatedMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(vctx.device, allocatedMemory, null);
+            }
+            if (createdBuffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(vctx.device, createdBuffer, null);
+            }
+            throw failure;
         }
+
+        this.buffer = createdBuffer;
+        this.memory = allocatedMemory;
+        this.allocationSize = allocatedBytes;
         COUNT++;
         TOTAL_SIZE += size;
+        TOTAL_ALLOCATION_SIZE += allocatedBytes;
     }
 
     /** Maps the whole buffer; only valid for hostVisible buffers. */
@@ -84,6 +110,11 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
 
     public long size() {
         return this.size;
+    }
+
+    /** Actual VkDeviceMemory allocation size after Vulkan alignment/padding. */
+    public long allocationSize() {
+        return this.allocationSize;
     }
 
     @Override
@@ -111,6 +142,7 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
         this.free0();
         COUNT--;
         TOTAL_SIZE -= this.size;
+        TOTAL_ALLOCATION_SIZE -= this.allocationSize;
         this.ctx.deferDestroy(this.buffer, this.memory);
     }
 
@@ -118,7 +150,13 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
         return COUNT;
     }
 
+    /** Logical sizes requested by Voxy. */
     public static long getTotalSize() {
         return TOTAL_SIZE;
+    }
+
+    /** Actual VkDeviceMemory bytes reserved for live VkBuffers. */
+    public static long getTotalAllocationSize() {
+        return TOTAL_ALLOCATION_SIZE;
     }
 }
