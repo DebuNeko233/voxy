@@ -190,11 +190,36 @@ public final class VkImage2D {
         return this.allocationSize;
     }
 
-    public void free() {
-        if (this.freed) return;
+    private void accountFreed() {
         this.freed = true;
         COUNT--;
         TOTAL_ALLOCATION_SIZE -= this.allocationSize;
+    }
+
+    /**
+     * Immediate destruction is only for resources that were created as a
+     * transactional replacement but never referenced by any command buffer.
+     * Submitted/live images must use free() and Minecraft's retirement queue.
+     */
+    public void freeUnsubmittedNow() {
+        if (this.freed) return;
+        this.accountFreed();
+        var vctx = this.ctx.vk();
+        if (this.mipViews != null) {
+            for (long mipView : this.mipViews) {
+                if (mipView != VK_NULL_HANDLE) vkDestroyImageView(vctx.device, mipView, null);
+            }
+        }
+        for (long extraView : this.extraViews) {
+            if (extraView != VK_NULL_HANDLE) vkDestroyImageView(vctx.device, extraView, null);
+        }
+        if (this.view != VK_NULL_HANDLE) vkDestroyImageView(vctx.device, this.view, null);
+        Vma.vmaDestroyImage(vctx.vmaAllocator, this.image, this.allocation);
+    }
+
+    public void free() {
+        if (this.freed) return;
+        this.accountFreed();
 
         int mipCount = this.mipViews == null ? 0 : this.mipViews.length;
         long[] additionalViews = new long[mipCount + this.extraViews.size()];
