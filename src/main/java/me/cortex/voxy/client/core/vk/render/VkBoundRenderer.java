@@ -62,12 +62,11 @@ public class VkBoundRenderer {
             d.vertGlsl = VkShaderSource.load("voxy:chunkoutline/outline.vsh", VkShaderSource.defs().props(properties).build());
             d.fragGlsl = VkShaderSource.load("voxy:chunkoutline/outline.fsh", VkShaderSource.defs().props(properties).build());
             d.colorFormat = VK_FORMAT_UNDEFINED;
-            d.depthFormat = VK_FORMAT_D32_SFLOAT;//the depth-bound image format
+            d.depthFormat = VK_FORMAT_D32_SFLOAT;
             d.stencilFormat = VK_FORMAT_UNDEFINED;
             d.depthTest = true;
             d.depthWrite = true;
             d.colorWrite = false;
-            //"further" compare: keep the farthest fragment (the AABB back face)
             d.depthCompare = properties.isReverseZ() ? VK_COMPARE_OP_LESS : VK_COMPARE_OP_GREATER;
             d.bindings = List.of(VkShaderPipeline.ubo(0), VkShaderPipeline.ssbo(1));
             createdPipeline = new VkShaderPipeline(ctx, d);
@@ -84,19 +83,13 @@ public class VkBoundRenderer {
         this.pipeline = createdPipeline;
     }
 
-    //Records the bound raster into the frame. The depth-bound image is cleared
-    // inline as LOAD_OP_CLEAR (inverseClearDepth) by this pass — the previous
-    // compositor vkCmdClearDepthStencilImage + TRANSFER_DST round-trip +
-    // LOAD_OP_LOAD was a redundant tile load on TBDR. With no visible sections
-    // we still issue the clear-only pass so the terrain sampler sees the
-    // "no bound" state.
     public void render(VkViewport viewport, IBoundStore store) {
         store.preRender(viewport);
-        int count = store.getCount();
+        try {
+            int count = store.getCount();
 
-        if (count != 0) {
-            {//uniform: same 128-byte layout as the GL BoundRenderer (MVP', cameraBlockPos, fract, renderDistance)
-                final float renderDistance = Minecraft.getInstance().options.getEffectiveRenderDistance() * 16;//In blocks
+            if (count != 0) {
+                final float renderDistance = Minecraft.getInstance().options.getEffectiveRenderDistance() * 16;
                 long ptr = this.uploadStream.upload(this.uniform, 0, 128);
                 long matPtr = ptr; ptr += 4 * 4 * 4;
 
@@ -113,51 +106,57 @@ public class VkBoundRenderer {
                 viewport.MVP.translate(negInnerBlock.negate(), this.mvpScratch).getToAddress(matPtr);
                 MemoryUtil.memPutFloat(ptr, renderDistance);
                 this.uploadStream.commit();
+
+                this.ctx.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                        VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
             }
 
             var cmd = this.ctx.cmd();
-            this.ctx.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
-                    VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
-        }
+            viewport.depthBound.transition(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
-        var cmd = this.ctx.cmd();
-        viewport.depthBound.transition(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+            boolean rendering = false;
+            try {
+                try (MemoryStack stack = stackPush()) {
+                    var depthAttach = org.lwjgl.vulkan.VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
+                            .imageView(viewport.depthBound.view)
+                            .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                            .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                            .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                    depthAttach.clearValue().depthStencil().depth(this.properties.inverseClearDepth()).stencil(0);
+                    var info = org.lwjgl.vulkan.VkRenderingInfoKHR.calloc(stack).sType$Default()
+                            .renderArea(org.lwjgl.vulkan.VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
+                            .layerCount(1)
+                            .pDepthAttachment(depthAttach);
+                    vkCmdBeginRenderingKHR(cmd, info);
+                    rendering = true;
+                }
 
-        try (MemoryStack stack = stackPush()) {
-            var depthAttach = org.lwjgl.vulkan.VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
-                    .imageView(viewport.depthBound.view)
-                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            depthAttach.clearValue().depthStencil().depth(this.properties.inverseClearDepth()).stencil(0);
-            var info = org.lwjgl.vulkan.VkRenderingInfoKHR.calloc(stack).sType$Default()
-                    .renderArea(org.lwjgl.vulkan.VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
-                    .layerCount(1)
-                    .pDepthAttachment(depthAttach);
-            vkCmdBeginRenderingKHR(cmd, info);
-        }
-        if (count != 0) {
-            this.pipeline.bind(cmd);
-            VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
-            try (var b = this.pipeline.binder()) {
-                b.ubo(0, this.uniform)
-                        .ssbo(1, (VkBuffer) store.getBuffer())
-                        .push(cmd);
+                if (count != 0) {
+                    this.pipeline.bind(cmd);
+                    VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
+                    try (var b = this.pipeline.binder()) {
+                        b.ubo(0, this.uniform)
+                                .ssbo(1, (VkBuffer) store.getBuffer())
+                                .push(cmd);
+                    }
+                    vkCmdBindIndexBuffer(cmd, this.boxIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
+                    vkCmdDrawIndexed(cmd, 6 * 2 * 3, count, 0, 0, 0);
+                }
+            } finally {
+                if (rendering) {
+                    vkCmdEndRenderingKHR(cmd);
+                }
+                viewport.depthBound.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
             }
-            vkCmdBindIndexBuffer(cmd, this.boxIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
-            vkCmdDrawIndexed(cmd, 6 * 2 * 3, count, 0, 0, 0);
+        } finally {
+            store.postRender(viewport);
         }
-        vkCmdEndRenderingKHR(cmd);
-
-        viewport.depthBound.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-
-        store.postRender(viewport);
     }
 
     public void free() {
