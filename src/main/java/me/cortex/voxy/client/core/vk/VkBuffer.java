@@ -67,7 +67,12 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
                         .flags(Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT)
                         .requiredFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
             } else {
+                //Do not let large Voxy allocations silently push the shared
+                //Minecraft allocator beyond the driver's reported heap budget.
+                //Geometry already has a retry/downsize path, and other resources
+                //fail cleanly instead of forcing the driver into oversubscription.
                 aci.usage(Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE)
+                        .flags(Vma.VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT)
                         .preferredFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             }
 
