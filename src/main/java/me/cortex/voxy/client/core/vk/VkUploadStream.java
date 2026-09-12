@@ -27,6 +27,7 @@ public class VkUploadStream extends AbstractUploadStream {
 
     private long caddr = -1;
     private long offset = 0;
+    private boolean closed;
 
     public VkUploadStream(VkFrameCtx ctx, long size) {
         this.ctx = ctx;
@@ -67,6 +68,7 @@ public class VkUploadStream extends AbstractUploadStream {
 
     @Override
     public long upload(IDeviceBuffer buffer, long destOffset, long size) {
+        if (this.closed) throw new IllegalStateException("Vulkan upload stream is closed");
         if (!(buffer instanceof VkBuffer vkBuffer)) throw new IllegalArgumentException("Vulkan upload requires a VkBuffer destination");
         if (size <= 0 || size > Integer.MAX_VALUE) throw new IllegalArgumentException("Invalid Vulkan upload size: " + size);
         if (destOffset < 0 || destOffset > buffer.sizeBytes() - size) throw new IllegalArgumentException("Vulkan upload exceeds destination buffer");
@@ -77,21 +79,19 @@ public class VkUploadStream extends AbstractUploadStream {
 
     @Override
     public long rawUploadAddress(int size) {
+        if (this.closed) throw new IllegalStateException("Vulkan upload stream is closed");
         if (size < 0) throw new IllegalStateException("Negative size");
         size = this.alignUpAlloc(size);
-        if (size > this.stagingBuffer.size()) throw new IllegalArgumentException("Upload larger than Vulkan staging buffer");
+        if (size > this.stagingBuffer.size()) throw new IllegalArgumentException();
 
         long addr;
         if (this.caddr == -1 || !this.allocationArena.expand(this.caddr, size)) {
             this.caddr = this.allocationArena.alloc(size);
             if (this.caddr == SIZE_LIMIT) {
-                //The current Minecraft frame has not been submitted yet, so
-                //vkDeviceWaitIdle cannot make allocations consumed by this frame
-                //safe to reuse. Older versions attempted exactly that, which could
-                //overwrite staging bytes still referenced by an unsubmitted copy.
-                throw new IllegalStateException("Vulkan upload staging exhausted ("
-                        + (this.stagingBuffer.size() >> 20) + " MiB, pendingFrames=" + this.frames.size()
-                        + "). Cannot safely force-reuse staging memory before Minecraft submits the current frame.");
+                //The currently recording Minecraft frame may not have been
+                //submitted yet. vkDeviceWaitIdle cannot make those bytes safe
+                //to reuse, so never fake retirement here.
+                throw new IllegalStateException("Vulkan upload staging exhausted before Minecraft submission retirement");
             }
             this.thisFrameAllocations.add(this.caddr);
             this.offset = size;
@@ -106,6 +106,7 @@ public class VkUploadStream extends AbstractUploadStream {
 
     @Override
     public void commit() {
+        if (this.closed) return;
         if (this.uploadList.isEmpty()) {
             this.caddr = -1;
             this.offset = 0;
@@ -132,6 +133,7 @@ public class VkUploadStream extends AbstractUploadStream {
 
     @Override
     public void tick() {
+        if (this.closed) return;
         this.commit();
         if (!this.thisFrameAllocations.isEmpty()) {
             this.frames.add(new UploadFrame(this.ctx.currentFrame(), new LongArrayList(this.thisFrameAllocations)));
@@ -140,6 +142,7 @@ public class VkUploadStream extends AbstractUploadStream {
     }
 
     private void retireUpTo(long retiredFrame) {
+        if (this.closed) return;
         while (!this.frames.isEmpty() && this.frames.peek().frameIdx <= retiredFrame) {
             var frame = this.frames.pop();
             Throwable failure = null;
@@ -168,12 +171,17 @@ public class VkUploadStream extends AbstractUploadStream {
 
     @Override
     public void free() {
-        //CPU allocator bookkeeping can be discarded immediately because the
-        //stream will never allocate again. The VkBuffer itself is retired by
-        //Minecraft's submission-completion destruction queue.
-        this.frames.clear();
-        this.thisFrameAllocations.clear();
+        if (this.closed) return;
+        this.closed = true;
+        //CPU allocation bookkeeping can be discarded immediately. The staging
+        //VkBuffer itself is still deferred through Minecraft's submission-safe
+        //destruction queue, so no in-flight GPU command can see reused memory.
         this.uploadList.clear();
+        this.thisFrameAllocations.clear();
+        this.frames.clear();
+        this.caddr = -1;
+        this.offset = 0;
+        this.allocationArena.reset();
         this.stagingBuffer.free();
     }
 
