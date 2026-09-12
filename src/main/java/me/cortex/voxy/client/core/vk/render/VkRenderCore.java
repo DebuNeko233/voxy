@@ -280,7 +280,6 @@ public class VkRenderCore {
             viewport.hiZ.buildMipChain(viewport.depthSampleView, viewport.width, viewport.height);
             this.compositor.offscreenToAttachment(viewport);
 
-            this.downloadStream.tick();
             this.nodeManager.tick(this.traversal.getNodeBuffer(), this.nodeCleaner);
             this.nodeCleaner.tick(this.traversal.getNodeBuffer());
             this.traversal.doTraversal(viewport);
@@ -293,9 +292,15 @@ public class VkRenderCore {
             this.compositor.offscreenToSampled(viewport);
             this.compositor.composite(rt);
 
-            this.uploadStream.tick();
             this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ);
             this.modelService.tick(900_000);
+
+            //Package every staging/readback allocation made anywhere in this
+            //recording interval onto the same Voxy frame before endFrame() queues
+            //the host completion callback. This avoids an extra frame of staging
+            //retention and removes one frame of draw-count/readback latency.
+            this.downloadStream.tick();
+            this.uploadStream.tick();
         } finally {
             this.frameCtx.endFrame();
             this.frameCtx.pollRetired();
