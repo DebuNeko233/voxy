@@ -16,8 +16,12 @@ import static org.lwjgl.vulkan.VK10.*;
 public final class VkFrameHost {
     private VkFrameHost() {}
 
+    public static GpuTextureView lightmapTextureView() {
+        return Minecraft.getInstance().gameRenderer.levelLightmap();
+    }
+
     public static long lightmapView() {
-        return ((VulkanGpuTextureView) Minecraft.getInstance().gameRenderer.levelLightmap()).vkImageView();
+        return vkView(lightmapTextureView());
     }
 
     public static long vkView(GpuTextureView view) {
