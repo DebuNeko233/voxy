@@ -12,6 +12,7 @@ import org.lwjgl.vulkan.VkQueue;
 
 //IVkHost backed by Minecraft 26.2's live Blaze3D Vulkan device.
 public final class MinecraftVkHostAdapter implements IVkHost {
+    private static final long SYNCHRONOUS_SUBMIT_TIMEOUT_MS = 30_000L;
     private final VulkanDevice device;
 
     public MinecraftVkHostAdapter(VulkanDevice device) {
@@ -39,6 +40,24 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         //Minecraft's own private commandBuffer() path to allocate/begin/attach a
         //primary command buffer to the current submission instead of skipping.
         return current != null ? current : accessor.voxy$ensureCommandBuffer();
+    }
+
+    @Override
+    public void submitAndWaitCurrent() {
+        RenderSystem.assertOnRenderThread();
+        var encoder = this.encoder();
+        //createFence() snapshots the current timeline submit index. submit()
+        //signals that exact value before incrementing the encoder index, so the
+        //fence waits for the batch containing all commands Voxy just appended.
+        var fence = encoder.createFence();
+        try {
+            encoder.submit();
+            if (!fence.awaitCompletion(SYNCHRONOUS_SUBMIT_TIMEOUT_MS)) {
+                throw new IllegalStateException("Timed out waiting for Minecraft Vulkan submission used by Voxy");
+            }
+        } finally {
+            fence.close();
+        }
     }
 
     @Override
