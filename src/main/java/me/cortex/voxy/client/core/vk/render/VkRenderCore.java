@@ -160,6 +160,9 @@ public class VkRenderCore {
             } else if (models != null) {
                 try { models.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             }
+            if (models != null) {
+                try { models.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            }
             if (bounds != null) {
                 try { bounds.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             }
@@ -197,6 +200,7 @@ public class VkRenderCore {
                 try { download.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             }
             if (frame != null) {
+                try { frame.drainDeferredDestruction(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
                 try { frame.free(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             }
 
@@ -318,42 +322,65 @@ public class VkRenderCore {
         this.ssao.addDebugInfo(debug);
     }
 
+    private static void cleanup(String what, Runnable action) {
+        try {
+            action.run();
+        } catch (Throwable failure) {
+            Logger.error("Voxy VK cleanup failed: " + what, failure);
+        }
+    }
+
     public void shutdown() {
         if (this.shutDown) return;
         this.shutDown = true;
         Logger.info("Shutting down Voxy pure-Vulkan render core");
 
-        try {
+        //Stop every CPU producer independently. One failed callback/service must
+        //not leave the remaining workers running while GPU resources are freed.
+        cleanup("detach world callbacks", () -> {
             this.worldIn.setDirtyCallback(null);
             this.worldIn.getMapper().setBiomeCallback(null);
             this.worldIn.getMapper().setStateCallback(null);
-            this.nodeManager.stop();
-            this.renderGen.shutdown();
-        } catch (Exception e) {
-            Logger.error("Error stopping VK render core CPU services", e);
-        }
+        });
+        cleanup("node manager stop", this.nodeManager::stop);
+        cleanup("render generation shutdown", this.renderGen::shutdown);
 
         boolean deviceAlive = MinecraftVkHost.get() != null;
         if (deviceAlive) {
-            try {
-                this.frameCtx.waitIdleRetireAll();
-                this.modelService.shutdown();
-                this.boundRenderer.free();
-                this.visibleSectionStream.free();
-                this.traversal.free();
-                this.nodeCleaner.free();
-                this.geometryData.free();
-                this.terrainRenderer.free();
-                this.ssao.free();
-                this.compositor.free();
-                this.viewportSelector.free();
-                this.downloadStream.flushWaitClear();
-                this.uploadStream.free();
-                this.downloadStream.free();
-                this.frameCtx.free();
-            } catch (Exception e) {
-                Logger.error("Error shutting down VK render core GPU resources", e);
-            }
+            //Finish already-recorded GPU use before beginning teardown. This is
+            //not enough by itself to run Mojang's DestructionQueue; the explicit
+            //host drain below advances every destruction slot after all frees
+            //have been queued.
+            cleanup("initial device idle", this.frameCtx::waitIdleRetireAll);
+
+            //Close readback callbacks before rotating old frame-completion slots;
+            //otherwise a late completed readback could feed a node manager that
+            //has already been stopped.
+            cleanup("download stream close", this.downloadStream::flushWaitClear);
+
+            //Each component is best-effort. In particular, a model/pipeline
+            //cleanup failure must never strand the much larger geometry/atlas
+            //allocations from the same world.
+            cleanup("model bakery shutdown", this.modelService::shutdown);
+            cleanup("model store fallback free", this.modelStore::free);
+            cleanup("bound renderer", this.boundRenderer::free);
+            cleanup("visible section stream", this.visibleSectionStream::free);
+            cleanup("traversal", this.traversal::free);
+            cleanup("node cleaner", this.nodeCleaner::free);
+            cleanup("geometry data", this.geometryData::free);
+            cleanup("terrain renderer", this.terrainRenderer::free);
+            cleanup("SSAO", this.ssao::free);
+            cleanup("compositor", this.compositor::free);
+            cleanup("viewports", this.viewportSelector::free);
+            cleanup("upload stream", this.uploadStream::free);
+            cleanup("download stream final free", this.downloadStream::free);
+
+            //Mojang 26.2 rotates a two-slot destruction queue only from submit().
+            //Device-idle does not rotate it. Advancing all host slots here makes
+            //world unload/reload release VMA allocations before the next world's
+            //renderer is created instead of temporarily stacking both worlds.
+            cleanup("host deferred destruction drain", this.frameCtx::drainDeferredDestruction);
+            cleanup("frame context", this.frameCtx::free);
         } else {
             Logger.warn("Voxy VK: Minecraft's Vulkan device is already gone at shutdown; "
                     + "skipping GPU teardown to avoid destroying objects on a dead device");
