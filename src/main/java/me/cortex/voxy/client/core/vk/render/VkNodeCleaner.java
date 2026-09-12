@@ -19,13 +19,15 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.vkCmdDispatch;
 
 //Pure-VK port of NodeCleaner: finds the least-recently-rendered nodes on the
-// GPU (sort + transform computes) and feeds them back to the AsyncNodeManager
-// for geometry eviction when the geometry buffer runs low. Mirrors the GL
-// implementation pass-for-pass.
+//GPU (sort + transform computes) and feeds them back to the AsyncNodeManager
+//for geometry eviction when the geometry buffer runs low. Mirrors the GL
+//implementation pass-for-pass.
 public class VkNodeCleaner implements INodeCleaner {
     private static final int SORTING_WORKER_SIZE = 64;
     private static final int WORK_PER_THREAD = 8;
     static final int OUTPUT_COUNT = 256;
+    private static final long MIN_CLEANER_HEADROOM = 8L << 20;
+    private static final long MAX_CLEANER_HEADROOM = 256_000_000L;
 
     private final VkFrameCtx ctx;
     private final VkUploadStream uploadStream;
@@ -93,8 +95,8 @@ public class VkNodeCleaner implements INodeCleaner {
             if (output != null) output.free();
             if (visibility != null) visibility.free();
             //The buffer initialisation fills were submitted synchronously above;
-            // retire deferred destroys now so a failed renderer construction does
-            // not leave cleaner allocations resident until some future frame.
+            //retire deferred destroys now so a failed renderer construction does
+            //not leave cleaner allocations resident until some future frame.
             ctx.waitIdleRetireAll();
             throw failure;
         }
@@ -146,8 +148,16 @@ public class VkNodeCleaner implements INodeCleaner {
     }
 
     private boolean shouldCleanGeometry() {
-        long remaining = this.nodeManager.getGeometryCapacity() - this.nodeManager.getUsedGeometryCapacity();
-        return remaining < 256_000_000;//If less than 256 mb free memory
+        long capacity = this.nodeManager.getGeometryCapacity();
+        long remaining = capacity - this.nodeManager.getUsedGeometryCapacity();
+        //The original 256 MB watermark assumed a multi-gigabyte geometry store.
+        //Vulkan can now downsize that store to 64/128/256 MiB under VMA budget
+        //pressure; a fixed 256 MB watermark would make the cleaner run nearly
+        //every frame and thrash freshly generated LOD geometry. Keep roughly the
+        //same 1/8-capacity policy, bounded for very small and very large stores.
+        long threshold = Math.max(MIN_CLEANER_HEADROOM,
+                Math.min(MAX_CLEANER_HEADROOM, capacity / 8));
+        return remaining < threshold;
     }
 
     @Override
