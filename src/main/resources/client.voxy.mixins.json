@@ -39,6 +39,7 @@
     "sodium.MixinSodiumWorldRenderer",
     "sodium.MixinVisibleChunkCollector",
     "vk.AccessorVulkanCommandEncoder",
+    "vk.AccessorVulkanDevice",
     "vk.MixinSodiumOpaqueVkFrame",
     "vk.MixinVulkanDevice"
   ],
