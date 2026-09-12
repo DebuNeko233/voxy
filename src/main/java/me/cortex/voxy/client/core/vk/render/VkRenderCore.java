@@ -104,19 +104,17 @@ public class VkRenderCore {
                     + (vctx.integratedGpu ? " (integrated GPU policy)" : " (discrete GPU policy)"));
             geometry = new VkSectionGeometryData(frame, 1 << 20, geometryCapacity);
 
-            //Keep ownership locally until AsyncNodeManager has completed its own
-            // construction. If that constructor throws, there is no manager
-            // instance whose stop() can release the GPU ops.
             nodeOps = new VkNodeGpuOps(frame, upload);
             nodes = new AsyncNodeManager(1 << 21, geometry, generation, nodeOps);
-            nodeOps = null; //ownership transferred to AsyncNodeManager
+            nodeOps = null;
 
             cleaner = new VkNodeCleaner(frame, upload, download, nodes);
             traverse = new VkTraversal(frame, upload, download, props, nodes, cleaner, generation);
             terrain = new VkTerrainRenderer(frame, upload, download, props, geometry, models);
             compose = new VkCompositor(frame, upload, props, VoxyConfig.CONFIG.getFogMode().hasFog);
             ao = new VkSSAO(frame, upload, props, VoxyConfig.CONFIG.getSSAOMode());
-            visible = new StreamedBoundStore(size -> new VkBuffer(frame, size));
+            final VkFrameCtx selectedFrame = frame;
+            visible = new StreamedBoundStore(size -> new VkBuffer(selectedFrame, size));
             bounds = new VkBoundRenderer(frame, upload, props);
 
             world.setDirtyCallback(nodes::worldEvent);
@@ -124,7 +122,6 @@ public class VkRenderCore {
             world.getMapper().setBiomeCallback(modelBakery::addBiome);
             nodes.start();
 
-            final VkFrameCtx selectedFrame = frame;
             final RenderProperties selectedProps = props;
             final VkSectionGeometryData selectedGeometry = geometry;
             viewports = new ViewportSelector<>(() ->
