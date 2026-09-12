@@ -194,6 +194,26 @@ public final class VkFrameCtx {
         this.throwDeferredFailure();
     }
 
+    /**
+     * Flush every Minecraft destruction slot after Voxy has queued its frees.
+     * Device-idle alone is insufficient because Mojang rotates its two-slot
+     * DestructionQueue only from VulkanCommandEncoder.submit().
+     */
+    public void drainDeferredDestruction() {
+        RenderSystem.assertOnRenderThread();
+        if (this.frameCmd != null) {
+            throw new IllegalStateException("Cannot drain Vulkan destruction queues while a frame is active");
+        }
+        if (this.closed) throw new IllegalStateException("VkFrameCtx is closed");
+        this.flushImmediate();
+        this.ctx.drainDeferredDestruction();
+        this.throwDeferredFailure();
+        if (this.pendingNativeDestroys != 0) {
+            Logger.warn("Voxy VK: " + this.pendingNativeDestroys
+                    + " native destroys remain after host destruction-queue drain");
+        }
+    }
+
     private static Throwable collectFailure(Throwable first, Throwable next) {
         if (first == null) return next;
         first.addSuppressed(next);
