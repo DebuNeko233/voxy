@@ -155,52 +155,59 @@ public class VkCompositor {
         VkFrameHost.transitionMcImage(cmd, rt.mcDepth, true,
                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-        try (MemoryStack stack = stackPush()) {
-            //pColorAttachments takes a Buffer, while pDepthAttachment and
-            //pStencilAttachment take one VkRenderingAttachmentInfo struct.
-            var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
-                    .imageView(viewport.colour.view)
-                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            colorAttach.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
-            var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
-                    .imageView(viewport.depthStencil.view)
-                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            depthAttach.clearValue().depthStencil().depth(this.properties.clearDepth()).stencil(1);
-            var stencilAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
-                    .imageView(viewport.depthStencil.view)
-                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            stencilAttach.clearValue().depthStencil().depth(this.properties.clearDepth()).stencil(1);
-            var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
-                    .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
-                    .layerCount(1)
-                    .pColorAttachments(colorAttach)
-                    .pDepthAttachment(depthAttach)
-                    .pStencilAttachment(stencilAttach);
-            vkCmdBeginRenderingKHR(cmd, info);
-        }
-        this.depthSetup.bind(cmd);
-        VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
-        try (var b = this.depthSetup.binder()) {
-            b.sampler(0, VkFrameHost.vkView(rt.mcDepth), this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .push(cmd);
-        }
-        try (MemoryStack stack = stackPush()) {
-            var pc = stack.malloc(8);
-            pc.putFloat(0, ((float) viewport.width) / rt.mcWidth);
-            pc.putFloat(4, ((float) viewport.height) / rt.mcHeight);
-            this.depthSetup.pushConstants(cmd, pc);
-        }
-        vkCmdDraw(cmd, 4, 1, 0, 0);
-        vkCmdEndRenderingKHR(cmd);
+        boolean rendering = false;
+        try {
+            try (MemoryStack stack = stackPush()) {
+                //pColorAttachments takes a Buffer, while pDepthAttachment and
+                //pStencilAttachment take one VkRenderingAttachmentInfo struct.
+                var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+                        .imageView(viewport.colour.view)
+                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                colorAttach.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);
+                var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
+                        .imageView(viewport.depthStencil.view)
+                        .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                depthAttach.clearValue().depthStencil().depth(this.properties.clearDepth()).stencil(1);
+                var stencilAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
+                        .imageView(viewport.depthStencil.view)
+                        .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                stencilAttach.clearValue().depthStencil().depth(this.properties.clearDepth()).stencil(1);
+                var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
+                        .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
+                        .layerCount(1)
+                        .pColorAttachments(colorAttach)
+                        .pDepthAttachment(depthAttach)
+                        .pStencilAttachment(stencilAttach);
+                vkCmdBeginRenderingKHR(cmd, info);
+                rendering = true;
+            }
 
-        VkFrameHost.transitionMcImage(cmd, rt.mcDepth, true,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            this.depthSetup.bind(cmd);
+            VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
+            try (var b = this.depthSetup.binder()) {
+                b.sampler(0, VkFrameHost.vkView(rt.mcDepth), this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .push(cmd);
+            }
+            try (MemoryStack stack = stackPush()) {
+                var pc = stack.malloc(8);
+                pc.putFloat(0, ((float) viewport.width) / rt.mcWidth);
+                pc.putFloat(4, ((float) viewport.height) / rt.mcHeight);
+                this.depthSetup.pushConstants(cmd, pc);
+            }
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+        } finally {
+            if (rendering) {
+                vkCmdEndRenderingKHR(cmd);
+            }
+            VkFrameHost.transitionMcImage(cmd, rt.mcDepth, true,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        }
     }
 
     public void offscreenToSampled(VkViewport viewport) {
@@ -264,34 +271,42 @@ public class VkCompositor {
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-        try (MemoryStack stack = stackPush()) {
-            var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
-                    .imageView(VkFrameHost.vkView(rt.mcColour))
-                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
-                    .imageView(VkFrameHost.vkView(rt.mcDepth))
-                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
-                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
-            var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
-                    .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(rt.mcWidth).height(rt.mcHeight)))
-                    .layerCount(1)
-                    .pColorAttachments(colorAttach)
-                    .pDepthAttachment(depthAttach);
-            vkCmdBeginRenderingKHR(cmd, info);
+        boolean rendering = false;
+        try {
+            try (MemoryStack stack = stackPush()) {
+                var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
+                        .imageView(VkFrameHost.vkView(rt.mcColour))
+                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
+                        .imageView(VkFrameHost.vkView(rt.mcDepth))
+                        .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
+                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
+                        .renderArea(VkRect2D.calloc(stack).extent(e -> e.width(rt.mcWidth).height(rt.mcHeight)))
+                        .layerCount(1)
+                        .pColorAttachments(colorAttach)
+                        .pDepthAttachment(depthAttach);
+                vkCmdBeginRenderingKHR(cmd, info);
+                rendering = true;
+            }
+
+            this.composite.bind(cmd);
+            VkCmd.setViewportScissor(cmd, rt.mcWidth, rt.mcHeight);
+            try (var b = this.composite.binder()) {
+                b.sampler(0, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .ubo(1, this.compositeParams)
+                        .sampler(3, viewport.colourSSAO.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .push(cmd);
+            }
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+        } finally {
+            if (rendering) {
+                vkCmdEndRenderingKHR(cmd);
+            }
         }
-        this.composite.bind(cmd);
-        VkCmd.setViewportScissor(cmd, rt.mcWidth, rt.mcHeight);
-        try (var b = this.composite.binder()) {
-            b.sampler(0, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .ubo(1, this.compositeParams)
-                    .sampler(3, viewport.colourSSAO.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .push(cmd);
-        }
-        vkCmdDraw(cmd, 4, 1, 0, 0);
-        vkCmdEndRenderingKHR(cmd);
     }
 
     public void free() {
