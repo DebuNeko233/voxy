@@ -26,6 +26,14 @@ jobs:
         with:
           cache-read-only: true
 
+      - name: Verify one-click build scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n build-mod-linux.sh
+          bash -n build-mod-macos.command
+          test -f build-mod-windows.bat
+
       - name: Verify Vulkan host ownership
         shell: bash
         run: |
