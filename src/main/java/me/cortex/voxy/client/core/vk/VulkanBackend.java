@@ -50,8 +50,18 @@ public final class VulkanBackend {
     public static synchronized String statusLine() {
         if (supported == null) return "vk: unprobed";
         if (!supported || context == null) return "vk: unavailable (" + unsupportedReason + ")";
-        return "vk: host(" + context.deviceName + "), images=" + VkImage2D.getCount()
-                + "/" + (VkImage2D.getTotalAllocationSize() >> 20) + "MiB)";
+        try {
+            var budget = context.deviceLocalBudget();
+            return "vk: host(" + context.deviceName + "), images=" + VkImage2D.getCount()
+                    + "/" + (VkImage2D.getTotalAllocationSize() >> 20) + "MiB"
+                    + ", vma=" + (budget.usageBytes() >> 20) + "/" + (budget.budgetBytes() >> 20) + "MiB"
+                    + ", free=" + (budget.availableBytes() >> 20) + "MiB)";
+        } catch (RuntimeException | Error budgetFailure) {
+            //Debug rendering must never be able to take the renderer down just
+            //because a driver/VMA budget query is temporarily unavailable.
+            return "vk: host(" + context.deviceName + "), images=" + VkImage2D.getCount()
+                    + "/" + (VkImage2D.getTotalAllocationSize() >> 20) + "MiB, vma=n/a)";
+        }
     }
 
     public static synchronized void shutdown() {
