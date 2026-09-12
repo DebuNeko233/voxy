@@ -30,6 +30,12 @@ public final class VulkanContext {
     public final boolean hasDrawIndirectCount;
 
     private static final boolean ENABLE_SUBGROUP_PATHS = false;
+    //VkSubgroupFeatureFlagBits values from Vulkan 1.1. Keep these local because
+    //the LWJGL class bundled by a given Minecraft runtime may not re-export the
+    //named constants even though VkPhysicalDeviceSubgroupProperties is present.
+    private static final int SUBGROUP_FEATURE_BASIC_BIT = 0x00000001;
+    private static final int SUBGROUP_FEATURE_ARITHMETIC_BIT = 0x00000004;
+    private static final int SUBGROUP_FEATURE_CLUSTERED_BIT = 0x00000040;
 
     public final boolean subgroupArithmetic;
     public final int subgroupSize;
@@ -60,7 +66,7 @@ public final class VulkanContext {
         this.subgroupSize = subgroup != null ? subgroup.subgroupSize() : 1;
         int ops = subgroup != null ? subgroup.supportedOperations() : 0;
         int stages = subgroup != null ? subgroup.supportedStages() : 0;
-        int needOps = VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT;
+        int needOps = SUBGROUP_FEATURE_ARITHMETIC_BIT | SUBGROUP_FEATURE_BASIC_BIT | SUBGROUP_FEATURE_CLUSTERED_BIT;
         boolean deviceSupportsSubgroups = (ops & needOps) == needOps
                 && (stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0
                 && this.subgroupSize >= 16;
